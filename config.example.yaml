@@ -1,0 +1,117 @@
+server:
+  host: "0.0.0.0"
+  port: 8080
+  read_timeout: 30s
+  write_timeout: 30s
+
+oidc:
+  # Your OIDC provider's issuer URL
+  # RECOMMENDED: Set via OIDC_ISSUER environment variable
+  issuer: ""
+
+  # Client credentials
+  # SECURITY: Set these via environment variables instead:
+  #   OIDC_CLIENT_ID
+  #   OIDC_CLIENT_SECRET
+  client_id: ""
+  client_secret: ""
+
+  # The claim in the JWT that contains role names
+  roles_claim: "Roles"
+
+  # Optional: Additional claims to extract for logging
+  user_claim: "sub"
+  email_claim: "email"
+
+  # Session cache TTL - how long to cache user info before revalidating with OIDC provider
+  # Default: 15m (15 minutes)
+  # Set via OIDC_SESSION_CACHE_TTL environment variable (e.g., "10m", "30m", "1h")
+  # After this time, the access token is revalidated via the userinfo endpoint
+  # If validation succeeds, the session cache is extended by this duration
+  session_cache_ttl: 15m
+
+s3:
+  # S3 endpoint (use https://s3.amazonaws.com for AWS S3)
+  # RECOMMENDED: Set via S3_ENDPOINT environment variable
+  endpoint: ""
+
+  # AWS region
+  # RECOMMENDED: Set via S3_REGION or AWS_REGION environment variable
+  region: ""
+
+  # Backend type for admin provisioning:
+  #   "ceph"  - CEPH RadosGW (uses Admin API for sub-user provisioning)
+  #   "aws"   - AWS S3 (uses IAM API for access key provisioning)
+  #   "minio" - MinIO (uses Admin API for service account provisioning)
+  #   "local" - Local keys only (no backend provisioning, testing only)
+  # RECOMMENDED: Set via S3_BACKEND environment variable
+  backend: "local"
+
+  # S3 credentials (root/admin credentials for gateway operations)
+  # SECURITY: Set these via environment variables instead:
+  #   S3_ACCESS_KEY or AWS_ACCESS_KEY_ID
+  #   S3_SECRET_KEY or AWS_SECRET_ACCESS_KEY
+  access_key: ""
+  secret_key: ""
+
+  # Optional: Use IAM role instead of static credentials
+  # Set via S3_USE_IAM_ROLE environment variable
+  use_iam_role: false
+
+  # Optional: Custom S3-compatible storage (MinIO, Wasabi, etc.)
+  # Set via S3_FORCE_PATH_STYLE environment variable
+  force_path_style: false
+
+policies:
+  # Directory containing policy JSON files (synced to S3 backend)
+  directory: "./policies"
+
+  # Default policy when no roles match
+  default_deny: true
+
+  # Cache policies in memory (improves performance)
+  cache_enabled: true
+  cache_ttl: 300s
+
+roles:
+  # Directory for role definitions (maps OIDC roles to policies)
+  directory: "./data/roles"
+
+logging:
+  # Log level: debug, info, warn, error
+  level: "info"
+
+  # Log format: json, text
+  format: "json"
+
+  # Log file path (empty for stdout only)
+  file: ""
+
+  # Enable access logging
+  access_log: true
+
+  # Log S3 operations
+  audit_log: true
+
+security:
+  # Enable request signature validation
+  validate_signatures: true
+
+  # Allowed HTTP methods
+  allowed_methods:
+  - GET
+  - PUT
+  - POST
+  - DELETE
+  - HEAD
+  # Enable CORS
+  cors_enabled: true
+  cors_origins:
+  - "*"
+  # Rate limiting (requests per minute per user)
+  rate_limit: 1000
+
+monitoring:
+  # Enable Prometheus metrics endpoint
+  metrics_enabled: true
+  metrics_port: 9090

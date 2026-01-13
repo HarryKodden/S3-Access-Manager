@@ -1,0 +1,46 @@
+# Binaries
+s3-gateway
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+*.out
+
+# Config files
+config.yaml
+*.env
+.env*
+
+# Data directory (contains user credentials)
+data/
+!data/.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Credentials
+*.pem
+*.key
+*.crt
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dependencies
+vendor/
+
+# Build
+dist/
+build/

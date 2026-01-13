@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>S3 Access Manager</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Login Screen -->
+        <div id="login-screen" class="screen active">
+            <div class="login-container">
+                <div class="logo">
+                    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                        <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
+                        <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
+                        <line x1="12" y1="22.08" x2="12" y2="12"></line>
+                    </svg>
+                </div>
+                <h1>S3 Access Manager</h1>
+                <p class="subtitle">Secure S3 Access with OIDC Authentication</p>
+                
+                <div class="login-form">
+                    <!-- OIDC config fields hidden - loaded automatically from backend -->
+                    <input type="hidden" id="oidc-issuer" />
+                    <input type="hidden" id="client-id" />
+                    <button id="login-btn" class="btn btn-primary">
+                        <span>Sign In</span>
+                    </button>
+                </div>
+
+                <div class="info-box">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                        <circle cx="12" cy="12" r="10"></circle>
+                        <line x1="12" y1="16" x2="12" y2="12"></line>
+                        <line x1="12" y1="8" x2="12.01" y2="8"></line>
+                    </svg>
+                    <span>Your credentials are stored securely and never leave your browser</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Dashboard -->
+        <div id="dashboard-screen" class="screen">
+            <!-- Header -->
+            <header class="header">
+                <div class="header-left">
+                    <h2>S3 Access Manager</h2>
+                </div>
+                <div class="header-right">
+                    <span class="user-info" id="user-info"></span>
+                    <div class="admin-toggle" id="admin-toggle-container" style="display: none; margin: 0 1rem; align-items: center;">
+                        <label class="toggle-switch">
+                            <input type="checkbox" id="admin-mode-toggle" checked>
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span style="margin-left: 0.5rem; font-size: 0.875rem; color: var(--text-secondary);" id="admin-mode-label">Admin View</span>
+                    </div>
+                    <button id="logout-btn" class="btn btn-secondary">Logout</button>
+                </div>
+            </header>
+
+            <!-- Main Content -->
+            <div class="content">
+                <!-- Navigation Tabs -->
+                <nav class="tabs">
+                    <button class="tab active" data-tab="credentials">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                            <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                        </svg>
+                        Credentials
+                    </button>
+                    <button class="tab admin-only"  data-tab="policies">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                            <polyline points="14 2 14 8 20 8"></polyline>
+                            <line x1="16" y1="13" x2="8" y2="13"></line>
+                            <line x1="16" y1="17" x2="8" y2="17"></line>
+                            <polyline points="10 9 9 9 8 9"></polyline>
+                        </svg>
+                        Policies
+                    </button>
+                    <button class="tab admin-only"  data-tab="roles">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                            <circle cx="9" cy="7" r="4"></circle>
+                            <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+                            <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                            <circle cx="9" cy="7" r="1"></circle>
+                        </svg>
+                        Roles
+                    </button>
+                    <button class="tab" data-tab="buckets">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                        </svg>
+                        Buckets
+                    </button>
+                    <button class="tab admin-only" data-tab="users" style="display: none;">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                            <circle cx="9" cy="7" r="4"></circle>
+                            <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
+                            <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                        </svg>
+                        Users
+                    </button>
+                </nav>
+
+                <!-- Tab Contents -->
+                <div class="tab-content">
+                    <!-- Credentials Tab -->
+                    <div id="credentials-tab" class="tab-panel active">
+                        <div class="panel-header">
+                            <h3>S3 Credentials</h3>
+                            <div style="display: flex; gap: 0.5rem;">
+                                <button id="update-credentials-btn" class="btn btn-secondary btn-sm admin-only" title="Update All Credentials" style="display: none;">
+                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" style="vertical-align: middle; margin-right: 0.25rem;">
+                                        <path d="M21.5 2v6h-6M21.5 2l-6 6M2.5 22v-6h6M2.5 22l6-6M16 9.5A6.5 6.5 0 1 1 9.5 16c1.61 0 3.09-.59 4.23-1.57"></path>
+                                        <path d="M9.5 16V9.5l4 2.25"></path>
+                                    </svg>
+                                    Update All
+                                </button>
+                                <button id="create-credential-btn" class="btn-icon" title="Create Credential" style="width: auto; padding: 0.5rem 0.75rem;">
+                                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <line x1="12" y1="5" x2="12" y2="19"></line>
+                                        <line x1="5" y1="12" x2="19" y2="12"></line>
+                                    </svg>
+                                </button>
+                            </div>
+                        </div>
+                        <div id="credentials-list" class="credentials-list">
+                            <!-- Credentials will be loaded here -->
+                        </div>
+                    </div>
+
+                    <!-- Policies Tab -->
+                    <div id="policies-tab" class="tab-panel">
+                        <div class="panel-header">
+                            <h3>Access Policies</h3>
+                            <button class="btn-icon admin-only" onclick="showCreatePolicyModal()" title="New Policy" style="width: auto; padding: 0.5rem 0.75rem;">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                                </svg>
+                            </button>
+                        </div>
+                        <div id="policies-list" class="policies-list">
+                            <!-- Policies will be displayed here -->
+                        </div>
+                    </div>
+
+                    <!-- Roles Tab -->
+                    <div id="roles-tab" class="tab-panel">
+                        <div class="panel-header">
+                            <h3>Role Mappings</h3>
+                            <button class="btn-icon admin-only" onclick="showCreateRoleModal()" title="New Role" style="width: auto; padding: 0.5rem 0.75rem;">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                                </svg>
+                            </button>
+                        </div>
+                        <div id="roles-list" class="roles-list">
+                            <!-- Roles will be displayed here -->
+                        </div>
+                    </div>
+
+                    <!-- Buckets Tab -->
+                    <div id="buckets-tab" class="tab-panel">
+                        <div class="panel-header">
+                            <h3>Buckets</h3>
+                            <button id="create-bucket-btn" class="btn-icon" title="Create Bucket">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                                </svg>
+                            </button>
+                        </div>
+                        
+                        <!-- Credential Selector -->
+                        <div class="credential-selector-container" style="margin-bottom: 1rem; padding: 1rem; background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 8px;">
+                            <div style="display: flex; align-items: center; gap: 1rem;">
+                                <div style="flex: 1;">
+                                    <label for="bucket-credential-select" style="display: block; margin-bottom: 0.5rem; font-weight: 600; font-size: 0.875rem;">
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" style="vertical-align: middle; margin-right: 0.25rem;">
+                                            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                                            <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                                        </svg>
+                                        Select Credential for S3 Operations
+                                    </label>
+                                    <select id="bucket-credential-select" style="width: 100%; padding: 0.5rem; border: 1px solid var(--border-color); border-radius: 4px; background: var(--bg-color); color: var(--text-color); font-size: 0.875rem;">
+                                        <option value="">-- Select a credential --</option>
+                                    </select>
+                                    <small style="display: block; margin-top: 0.25rem; color: var(--text-secondary);">
+                                        All bucket and object operations will use the selected credential
+                                    </small>
+                                </div>
+                                <div id="selected-credential-info" style="display: none; padding: 0.75rem; background: var(--bg-color); border: 1px solid var(--success-color); border-radius: 4px; min-width: 200px;">
+                                    <div style="font-size: 0.75rem; color: var(--success-color); font-weight: 600; margin-bottom: 0.25rem;">
+                                        ✓ ACTIVE CREDENTIAL
+                                    </div>
+                                    <div id="selected-credential-name" style="font-weight: 600; font-size: 0.875rem;"></div>
+                                </div>
+                            </div>
+                        </div>
+                        
+                        <div id="buckets-list" class="credentials-list">
+                            <!-- Buckets will be displayed here -->
+                        </div>
+                    </div>
+
+                    <!-- Users Tab (Admin Only) -->
+                    <div id="users-tab" class="tab-panel admin-only" style="display: none;">
+                        <div class="panel-header">
+                            <h3>User Management</h3>
+                        </div>
+                        <div id="users-list" class="credentials-list">
+                            <!-- Users will be loaded here -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal for Create Credential -->
+    <div id="create-credential-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Create New Credential</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="cred-name">Credential Name</label>
+                    <input type="text" id="cred-name" placeholder="my-s3-access" />
+                </div>
+                <div class="form-group">
+                    <label for="cred-roles">Select Roles (one or more)</label>
+                    <div id="cred-roles" style="max-height: 200px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 4px; padding: 0.5rem;">
+                        <!-- Role checkboxes will be populated here -->
+                    </div>
+                    <small>Select one or more roles to assign to this credential</small>
+                </div>
+                <div class="form-group">
+                    <label for="cred-description">Description (optional)</label>
+                    <input type="text" id="cred-description" placeholder="Purpose of this credential" />
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary modal-cancel">Cancel</button>
+                <button class="btn btn-primary" id="confirm-create-credential">Create</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Inspect Credential Modal -->
+    <div id="inspect-credential-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Credential Details</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>Credential Name</label>
+                    <div id="inspect-cred-name" style="font-weight: 600;"></div>
+                </div>
+                <div class="form-group">
+                    <label>Access Key</label>
+                    <div id="inspect-cred-access-key" style="font-family: monospace;"></div>
+                </div>
+                <div class="form-group">
+                    <label>Secret Key</label>
+                    <div style="display: flex; align-items: center; gap: 0.5rem;">
+                        <div id="inspect-cred-secret-key" style="font-family: monospace; flex: 1;">••••••••••••••••</div>
+                        <button id="toggle-secret-visibility" class="btn-icon" title="Toggle visibility">
+                            <svg id="secret-eye-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                                <circle cx="12" cy="12" r="3"></circle>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Assigned Roles</label>
+                    <div id="inspect-cred-policies" style="display: flex; flex-wrap: wrap; gap: 0.5rem;">
+                        <!-- Role badges will be shown here -->
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Created</label>
+                    <div id="inspect-cred-created"></div>
+                </div>
+                <div class="form-group" id="inspect-cred-description-group" style="display: none;">
+                    <label>Description</label>
+                    <div id="inspect-cred-description"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary modal-close">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Notification Toast -->
+    <div id="toast" class="toast"></div>
+
+    <!-- Create Bucket Modal -->
+    <div id="create-bucket-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Create Bucket</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="new-bucket-name">Bucket Name</label>
+                    <input type="text" id="new-bucket-name" placeholder="e.g., my-data-bucket" />
+                    <small>Bucket names must be unique and follow S3 naming rules</small>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary modal-cancel">Cancel</button>
+                <button id="confirm-create-bucket" class="btn btn-primary">Create Bucket</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Inspect Bucket Modal -->
+    <div id="inspect-bucket-modal" class="modal">
+        <div class="modal-content" style="max-width: 900px;">
+            <div class="modal-header">
+                <h3 id="inspect-bucket-title">Bucket Contents</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="breadcrumb" id="bucket-breadcrumb" style="margin-bottom: 1rem;"></div>
+                <div id="bucket-objects-list" class="objects-list" style="max-height: 500px; overflow-y: auto;">
+                    <!-- Objects will be loaded here -->
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary modal-close">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Upload File Modal -->
+    <div id="upload-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Upload File to <span id="upload-bucket-name" style="color: var(--primary-color);"></span></h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="upload-file-input">Select File</label>
+                    <input type="file" id="upload-file-input" />
+                </div>
+                <div class="form-group">
+                    <label for="upload-key-prefix">Path (optional)</label>
+                    <input type="text" id="upload-key-prefix" placeholder="e.g., folder/subfolder" />
+                    <small>Leave empty to upload to bucket root</small>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary modal-cancel">Cancel</button>
+                <button id="confirm-upload" class="btn btn-primary" onclick="handleFileUpload()">Upload</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create/Edit Policy Modal -->
+    <div id="policy-modal" class="modal">
+        <div class="modal-content" style="max-width: 800px;">
+            <div class="modal-header">
+                <h3 id="policy-modal-title">Create New Policy</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="policy-name">Policy Name</label>
+                    <input type="text" id="policy-name" placeholder="my-policy" />
+                </div>
+                <div class="form-group">
+                    <label for="policy-description">Description (optional)</label>
+                    <input type="text" id="policy-description" placeholder="Purpose of this policy" />
+                </div>
+                <div class="form-group">
+                    <label for="policy-json">Policy JSON</label>
+                    <textarea id="policy-json" rows="20" style="width: 100%; font-family: 'Monaco', 'Menlo', 'Consolas', monospace; font-size: 0.875rem; resize: vertical;" placeholder='{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Resource": ["arn:aws:s3:::*"]
+    }
+  ]
+}'></textarea>
+                    <div id="policy-validation" style="margin-top: 0.5rem; font-size: 0.875rem;"></div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary modal-cancel">Cancel</button>
+                <button class="btn btn-secondary" onclick="validatePolicyJSON()">Validate</button>
+                <button class="btn btn-primary" id="confirm-save-policy">Save Policy</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create/Edit Role Modal -->
+    <div id="role-modal" class="modal">
+        <div class="modal-content" style="max-width: 700px;">
+            <div class="modal-header">
+                <h3 id="role-modal-title">Create New Role</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="role-name">Role Name</label>
+                    <input type="text" id="role-name" placeholder="admin" />
+                    <small>Must match OIDC role claim value (e.g., "admin", "developer", "viewer")</small>
+                </div>
+                <div class="form-group">
+                    <label for="role-description">Description (optional)</label>
+                    <input type="text" id="role-description" placeholder="Administrator with full access" />
+                </div>
+                <div class="form-group">
+                    <label>Assigned Policies</label>
+                    <div id="role-policies-selector" class="policies-selector" style="border: 1px solid var(--border-color); border-radius: 4px; padding: 0.75rem; max-height: 300px; overflow-y: auto;">
+                        <!-- Policy checkboxes will be loaded here -->
+                    </div>
+                    <small>Select one or more policies to assign to this role</small>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary modal-cancel">Cancel</button>
+                <button class="btn btn-primary" id="confirm-save-role">Save Role</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>
