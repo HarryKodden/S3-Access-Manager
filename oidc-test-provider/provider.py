@@ -18,10 +18,10 @@ from urllib.parse import urlparse, parse_qs
 PORT = 8888
 JWT_SECRET = "test-jwt-secret-key-do-not-use-in-production"
 # Use container name when running in docker, localhost otherwise
-ISSUER = os.getenv('OIDC_ISSUER_URL', f"http://localhost:{PORT}")
-CLIENT_ID = "test-client"
-CLIENT_SECRET = "test-secret"
-ROLES_CLAIM = os.getenv('OIDC_ROLES_CLAIM', 'Roles')
+ISSUER = os.getenv('ISSUER', f"http://localhost:{PORT}")
+CLIENT_ID = os.getenv('CLIENT_ID', "test-client")
+CLIENT_SECRET = os.getenv('CLIENT_SECRET', "test-secret")
+ROLES_CLAIM = os.getenv('ROLES_CLAIM', 'Roles')
 
 # Store authorization codes temporarily (in production, use Redis or similar)
 AUTH_CODES = {}
@@ -109,6 +109,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
 <!DOCTYPE html>
 <html>
 <head>
+    <meta charset="utf-8">
     <title>Sign In - OIDC Provider</title>
     <style>
         * {{
@@ -337,16 +338,13 @@ class OIDCHandler(BaseHTTPRequestHandler):
     
     def send_discovery_document(self):
         """Send OpenID Connect discovery document"""
-        # Use the request host to build URLs for external access
-        host = self.headers.get('Host', f'localhost:{PORT}')
-        base_url = f"http://{host}"
         
         discovery = {
-            "issuer": base_url,
-            "authorization_endpoint": f"{base_url}/authorize",
-            "token_endpoint": f"{base_url}/token",
-            "userinfo_endpoint": f"{base_url}/userinfo",
-            "jwks_uri": f"{base_url}/jwks",
+            "issuer": ISSUER,
+            "authorization_endpoint": f"{ISSUER}/authorize",
+            "token_endpoint": f"{ISSUER}/token",
+            "userinfo_endpoint": f"{ISSUER}/userinfo",
+            "jwks_uri": f"{ISSUER}/jwks",
             "response_types_supported": ["code", "token", "id_token"],
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["HS256"],
@@ -512,9 +510,10 @@ def main():
     print(f"✓ JWKS: {ISSUER}/jwks")
     print()
     print("Configure your .env with:")
-    print(f"  OIDC_ISSUER={ISSUER}")
-    print(f"  OIDC_CLIENT_ID={CLIENT_ID}")
-    print(f"  OIDC_CLIENT_SECRET={CLIENT_SECRET}")
+    print(f"  ISSUER={ISSUER}")
+    print(f"  CLIENT_ID={CLIENT_ID}")
+    print(f"  CLIENT_SECRET={CLIENT_SECRET}")
+    print(f". ROLES_CLAIM={ROLES_CLAIM} (if different)")
     print()
     print("Press Ctrl+C to stop...")
     print()

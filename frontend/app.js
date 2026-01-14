@@ -16,8 +16,29 @@ const state = {
     credentials: [],
     selectedCredential: null,  // Selected credential for S3 operations
     actualIsAdmin: false,      // Actual admin status from backend
-    simulatedIsAdmin: true     // Simulated admin status (togglable)
+    simulatedIsAdmin: true,    // Simulated admin status (togglable)
+    loadingCount: 0            // Counter for concurrent API calls
 };
+
+// Loading Spinner Functions
+function showLoadingSpinner() {
+    state.loadingCount++;
+    const spinner = document.getElementById('loading-spinner');
+    if (spinner) {
+        spinner.style.display = 'flex';
+    }
+}
+
+function hideLoadingSpinner() {
+    state.loadingCount--;
+    if (state.loadingCount <= 0) {
+        state.loadingCount = 0;
+        const spinner = document.getElementById('loading-spinner');
+        if (spinner) {
+            spinner.style.display = 'none';
+        }
+    }
+}
 
 // Initialize App
 document.addEventListener('DOMContentLoaded', () => {
@@ -426,7 +447,18 @@ async function discoverOIDCEndpoints(issuer) {
         if (!response.ok) {
             throw new Error('Failed to discover OIDC endpoints');
         }
-        return await response.json();
+        const config = await response.json();
+        
+        // Ensure endpoints use HTTPS if the current page is served over HTTPS
+        if (window.location.protocol === 'https:') {
+            for (const key in config) {
+                if (typeof config[key] === 'string' && config[key].startsWith('http://')) {
+                    config[key] = config[key].replace('http://', 'https://');
+                }
+            }
+        }
+        
+        return config;
     } catch (error) {
         console.error('OIDC discovery failed:', error);
         throw error;
@@ -446,10 +478,15 @@ async function handleLogin() {
     try {
         showToast('Initiating OIDC authentication...', 'info');
         
+        // Get OIDC configuration from localStorage
+        const storedConfig = JSON.parse(localStorage.getItem(CONFIG.oidcStorage) || '{}');
+        const scopes = storedConfig.scopes || 'openid profile email';
+        
         // Store OIDC configuration for callback
         const oidcConfig = {
             issuer: issuer,
-            client_id: clientId
+            client_id: clientId,
+            scopes: scopes
         };
         localStorage.setItem(CONFIG.oidcStorage, JSON.stringify(oidcConfig));
         
@@ -473,7 +510,7 @@ async function handleLogin() {
             client_id: clientId,
             redirect_uri: redirectUri,
             response_type: 'code',
-            scope: 'openid profile email',
+            scope: scopes,
             state: state,
             code_challenge: codeChallenge,
             code_challenge_method: 'S256'
@@ -563,6 +600,8 @@ async function apiCall(endpoint, options = {}) {
         console.log('Adding credential header:', state.selectedCredential);
     }
     
+    showLoadingSpinner();
+    
     try {
         const response = await fetch(`${CONFIG.gatewayUrl}${endpoint}`, {
             ...options,
@@ -622,11 +661,16 @@ async function apiCall(endpoint, options = {}) {
         
         const contentType = response.headers.get('content-type');
         if (contentType && contentType.includes('application/json')) {
-            return await response.json();
+            const result = await response.json();
+            hideLoadingSpinner();
+            return result;
         }
-        return await response.text();
+        const result = await response.text();
+        hideLoadingSpinner();
+        return result;
     } catch (error) {
         console.error('API call failed:', error);
+        hideLoadingSpinner();
         throw error;
     }
 }

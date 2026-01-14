@@ -71,12 +71,24 @@ func (h *CredentialHandler) ListCredentials(c *gin.Context) {
 		return
 	}
 
-	credentials, err := h.store.ListByUser(userInfo.Subject)
+	credentials, err := h.store.ListByUser(userInfo.Email)
 	if err != nil {
 		h.logger.WithError(err).Error("Failed to list credentials")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list credentials"})
 		return
 	}
+
+	h.logger.WithFields(logrus.Fields{
+		"user_id":    userInfo.Subject,
+		"cred_count": len(credentials),
+		"access_keys": func() []string {
+			keys := make([]string, len(credentials))
+			for i, c := range credentials {
+				keys[i] = c.AccessKey
+			}
+			return keys
+		}(),
+	}).Info("Listing credentials for user")
 
 	// Convert to response format (hide secret keys)
 	responses := make([]CredentialResponse, 0, len(credentials))
@@ -86,14 +98,14 @@ func (h *CredentialHandler) ListCredentials(c *gin.Context) {
 	var backendKeyMetadata []s3client.AccessKeyInfo
 	if h.iamClient != nil && h.adminClient != nil {
 		var err error
-		h.logger.WithField("username", userInfo.Subject).Debug("Checking IAM access keys for user")
-		backendAccessKeys, _ = h.iamClient.ListAccessKeys(c.Request.Context(), userInfo.Subject)
-		backendKeyMetadata, err = h.iamClient.ListAccessKeyMetadata(c.Request.Context(), userInfo.Subject)
+		h.logger.WithField("username", userInfo.Email).Debug("Checking IAM access keys for user")
+		backendAccessKeys, _ = h.iamClient.ListAccessKeys(c.Request.Context(), userInfo.Email)
+		backendKeyMetadata, err = h.iamClient.ListAccessKeyMetadata(c.Request.Context(), userInfo.Email)
 		if err != nil {
-			h.logger.WithError(err).WithField("username", userInfo.Subject).Warn("Failed to get access key metadata from IAM")
+			h.logger.WithError(err).WithField("username", userInfo.Email).Warn("Failed to get access key metadata from IAM")
 		} else {
 			h.logger.WithFields(logrus.Fields{
-				"username":  userInfo.Subject,
+				"username":  userInfo.Email,
 				"key_count": len(backendKeyMetadata),
 			}).Debug("Retrieved access key metadata from IAM")
 		}
@@ -196,16 +208,19 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 		"policy_count": len(policyDocuments),
 	}).Debug("Resolved roles to policy documents")
 
-	// Validate that requested policies are allowed by user's roles
-	userAllowedPolicies := h.roleStore.GetPoliciesForRoles(userInfo.Roles)
-	if !h.validatePolicies(policyNames, userAllowedPolicies) {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error":            "Cannot assign policies beyond your privileges",
-			"your_roles":       userInfo.Roles,
-			"allowed_policies": userAllowedPolicies,
-			"requested":        policyNames,
-		})
-		return
+	// Check if user is admin - admins can assign any policies
+	if !h.isAdmin(userInfo) {
+		// Validate that requested policies are allowed by user's roles
+		userAllowedPolicies := h.roleStore.GetPoliciesForRoles(userInfo.Roles)
+		if !h.validatePolicies(policyNames, userAllowedPolicies) {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":            "Cannot assign policies beyond your privileges",
+				"your_roles":       userInfo.Roles,
+				"allowed_policies": userAllowedPolicies,
+				"requested":        policyNames,
+			})
+			return
+		}
 	}
 
 	var accessKey, secretKey string
@@ -346,7 +361,7 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 	} else {
 		// No backend configured - generate local keys only (for testing)
 		h.logger.Warn("No CEPH or IAM backend configured, generating local keys only")
-		cred, err := h.store.Create(userInfo.Subject, req.Name, req.Description, req.Roles)
+		cred, err := h.store.Create(userInfo.Email, req.Name, req.Description, req.Roles)
 		if err != nil {
 			h.logger.WithError(err).Error("Failed to create credential")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create credential"})
@@ -374,10 +389,7 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 		backendData = make(map[string]interface{})
 	}
 
-	userID := userInfo.Subject
-	if userID == "" {
-		userID = userInfo.Email
-	}
+	userID := userInfo.Email
 
 	cred, err := h.store.CreateWithKeys(userID, req.Name, req.Description, req.Roles, accessKey, secretKey, credInfo.SessionToken, roleName, backendData)
 	if err != nil {
@@ -440,7 +452,7 @@ func (h *CredentialHandler) DeleteCredential(c *gin.Context) {
 	}
 
 	// Verify ownership
-	if cred.UserID != userInfo.Subject {
+	if cred.UserID != userInfo.Email {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
@@ -522,7 +534,7 @@ func (h *CredentialHandler) GetCredential(c *gin.Context) {
 	}
 
 	// Verify ownership
-	if cred.UserID != userInfo.Subject {
+	if cred.UserID != userInfo.Email {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied"})
 		return
 	}
@@ -819,4 +831,14 @@ func (h *CredentialHandler) UpdateCredentials(c *gin.Context) {
 	}
 
 	c.JSON(status, response)
+}
+
+// isAdmin checks if the user has admin role
+func (h *CredentialHandler) isAdmin(userInfo *auth.UserInfo) bool {
+	for _, role := range userInfo.Roles {
+		if role == "admin" {
+			return true
+		}
+	}
+	return false
 }

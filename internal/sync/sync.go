@@ -88,6 +88,11 @@ func (s *SyncService) SyncUser(ctx context.Context, userInfo *auth.UserInfo) err
 		return fmt.Errorf("failed to list current user policies: %w", err)
 	}
 
+	s.logger.WithFields(logrus.Fields{
+		"username":         username,
+		"current_policies": currentPolicies,
+	}).Debug("Current user policies")
+
 	// Step 3: Determine desired policies from OIDC roles using role store
 	desiredPolicies := make(map[string]bool)
 
@@ -105,13 +110,29 @@ func (s *SyncService) SyncUser(ctx context.Context, userInfo *auth.UserInfo) err
 
 	// Step 4: Add missing policies
 	for policy := range desiredPolicies {
+		s.logger.WithFields(logrus.Fields{
+			"username": username,
+			"policy":   policy,
+			"attached": contains(currentPolicies, policy),
+		}).Debug("Checking policy attachment")
+
 		if !contains(currentPolicies, policy) {
+			s.logger.WithFields(logrus.Fields{
+				"username": username,
+				"policy":   policy,
+			}).Info("Attaching missing policy")
+
 			if err := s.attachPolicyFromFile(ctx, username, policy); err != nil {
 				s.logger.WithError(err).WithFields(logrus.Fields{
 					"username": username,
 					"policy":   policy,
 				}).Warn("Failed to attach policy, continuing with other policies")
 			}
+		} else {
+			s.logger.WithFields(logrus.Fields{
+				"username": username,
+				"policy":   policy,
+			}).Debug("Policy already attached")
 		}
 	}
 

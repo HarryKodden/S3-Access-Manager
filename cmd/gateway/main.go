@@ -100,7 +100,7 @@ func main() {
 	authenticator.StartSessionCleanup(cleanupCtx)
 
 	// Initialize S3 client
-	s3Client, err := s3client.NewClient(cfg.S3, logger)
+	s3Client, err := s3client.NewClient(cfg.S3.IAM, logger)
 	if err != nil {
 		logger.WithError(err).Fatal("Failed to initialize S3 client")
 	}
@@ -108,12 +108,12 @@ func main() {
 	// Initialize IAM client with IAM-specific credentials
 	// Only initialize for backends that support IAM operations
 	var iamClient *s3client.IAMClient
-	iamClient, err = s3client.NewIAMClient(cfg.IAM, logger)
+	iamClient, err = s3client.NewIAMClient(cfg.S3.IAM, logger)
 
 	// Initialize backend-specific admin client based on backend type
 	var adminClient backend.AdminClient
 
-	awsCliClient, err := awscli.NewClient(cfg.S3.Endpoint, cfg.IAM.AccessKey, cfg.IAM.SecretKey, cfg.IAM.Region, logger)
+	awsCliClient, err := awscli.NewClient(cfg.S3.Endpoint, cfg.S3.IAM.AccessKey, cfg.S3.IAM.SecretKey, cfg.S3.IAM.Region, logger)
 	if err != nil {
 		logger.WithError(err).Warn("Failed to initialize AWS CLI client, using local keys only")
 	} else {

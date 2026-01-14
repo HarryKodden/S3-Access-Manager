@@ -26,7 +26,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo \
 # Runtime stage
 FROM alpine:latest
 
-RUN apk --no-cache add ca-certificates tzdata aws-cli
+RUN apk --no-cache add ca-certificates tzdata aws-cli curl
 
 WORKDIR /app
 

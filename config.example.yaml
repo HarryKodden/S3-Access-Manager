@@ -16,6 +16,11 @@ oidc:
   client_id: ""
   client_secret: ""
 
+  # OIDC scopes to request
+  # Default: "openid profile email eduPersonEntitlement"
+  # Set via OIDC_SCOPES environment variable
+  scopes: "openid profile email eduPersonEntitlement"
+
   # The claim in the JWT that contains role names
   roles_claim: "Roles"
 
@@ -47,20 +52,26 @@ s3:
   # RECOMMENDED: Set via S3_BACKEND environment variable
   backend: "local"
 
-  # S3 credentials (root/admin credentials for gateway operations)
-  # SECURITY: Set these via environment variables instead:
-  #   S3_ACCESS_KEY or AWS_ACCESS_KEY_ID
-  #   S3_SECRET_KEY or AWS_SECRET_ACCESS_KEY
-  access_key: ""
-  secret_key: ""
-
-  # Optional: Use IAM role instead of static credentials
-  # Set via S3_USE_IAM_ROLE environment variable
-  use_iam_role: false
-
   # Optional: Custom S3-compatible storage (MinIO, Wasabi, etc.)
   # Set via S3_FORCE_PATH_STYLE environment variable
   force_path_style: false
+
+  # IAM admin credentials for user/policy management on S3 backend
+  iam:
+    # SECURITY: Set these via environment variables instead:
+    #   IAM_ACCESS_KEY
+    #   IAM_SECRET_KEY
+    access_key: ""
+    secret_key: ""
+
+    # IAM endpoint (defaults to S3 endpoint if not specified)
+    # Set via IAM_ENDPOINT environment variable
+    endpoint: ""
+
+    # IAM region (defaults to S3 region if not specified)
+    # Set via IAM_REGION environment variable
+    region: ""
+
 
 policies:
   # Directory containing policy JSON files (synced to S3 backend)

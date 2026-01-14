@@ -66,12 +66,10 @@ func NewIAMClient(cfg config.IAMConfig, logger *logrus.Logger) (*IAMClient, erro
 	// Create IAM client with custom endpoint resolver for Ceph/MinIO
 	iamClient := iam.NewFromConfig(awsCfg, func(o *iam.Options) {
 		if cfg.Endpoint != "" {
-			// For Ceph/MinIO, IAM operations use the same endpoint as S3
 			o.BaseEndpoint = aws.String(cfg.Endpoint)
 			// Disable HTTPS requirement if needed
 			o.EndpointOptions.DisableHTTPS = false
 		}
-		// MinIO requires STS API version 2011-06-15
 		// Set the API version in the client options
 		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
 			return stack.Finalize.Add(

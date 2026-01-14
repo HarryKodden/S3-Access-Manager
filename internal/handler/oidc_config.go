@@ -23,6 +23,7 @@ func NewOIDCConfigHandler(cfg *config.Config) *OIDCConfigHandler {
 type OIDCConfigResponse struct {
 	Issuer   string `json:"issuer"`
 	ClientID string `json:"client_id"`
+	Scopes   string `json:"scopes"`
 }
 
 // GetOIDCConfig returns the OIDC configuration for the frontend
@@ -30,6 +31,7 @@ func (h *OIDCConfigHandler) GetOIDCConfig(c *gin.Context) {
 	response := OIDCConfigResponse{
 		Issuer:   h.config.OIDC.Issuer,
 		ClientID: h.config.OIDC.ClientID,
+		Scopes:   h.config.OIDC.Scopes,
 	}
 
 	c.JSON(http.StatusOK, response)

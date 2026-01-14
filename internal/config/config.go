@@ -15,7 +15,6 @@ type Config struct {
 	Server     ServerConfig     `yaml:"server"`
 	OIDC       OIDCConfig       `yaml:"oidc"`
 	S3         S3Config         `yaml:"s3"`
-	IAM        IAMConfig        `yaml:"iam"`
 	Policies   PoliciesConfig   `yaml:"policies"`
 	Roles      RolesConfig      `yaml:"roles"`
 	Logging    LoggingConfig    `yaml:"logging"`
@@ -37,21 +36,11 @@ type OIDCConfig struct {
 	Issuer          string        `yaml:"issuer"`
 	ClientID        string        `yaml:"client_id"`
 	ClientSecret    string        `yaml:"client_secret"`
+	Scopes          string        `yaml:"scopes"`
 	RolesClaim      string        `yaml:"roles_claim"`
 	UserClaim       string        `yaml:"user_claim"`
 	EmailClaim      string        `yaml:"email_claim"`
 	SessionCacheTTL time.Duration `yaml:"session_cache_ttl"` // Time before revalidating token, default 15 minutes
-}
-
-// S3Config contains S3 backend settings
-type S3Config struct {
-	Endpoint            string `yaml:"endpoint"`
-	Region              string `yaml:"region"`
-	DisableAutoCreation bool   `yaml:"disable_auto_creation"` // If true, users must manually add pre-created credentials
-	AccessKey           string `yaml:"access_key"`
-	SecretKey           string `yaml:"secret_key"`
-	UseIAMRole          bool   `yaml:"use_iam_role"`
-	ForcePathStyle      bool   `yaml:"force_path_style"`
 }
 
 // IAMConfig contains IAM admin credentials for user/policy management
@@ -60,6 +49,15 @@ type IAMConfig struct {
 	SecretKey string `yaml:"secret_key"`
 	Endpoint  string `yaml:"endpoint"`
 	Region    string `yaml:"region"`
+}
+
+// S3Config contains S3 backend settings
+type S3Config struct {
+	Endpoint            string    `yaml:"endpoint"`
+	Region              string    `yaml:"region"`
+	DisableAutoCreation bool      `yaml:"disable_auto_creation"` // If true, users must manually add pre-created credentials
+	ForcePathStyle      bool      `yaml:"force_path_style"`
+	IAM                 IAMConfig `yaml:"iam"` // IAM credentials for admin operations
 }
 
 // PoliciesConfig contains policy engine settings
@@ -127,7 +125,7 @@ func Load(path string) (*Config, error) {
 	if err := loadS3EnvVars(&cfg.S3); err != nil {
 		return nil, fmt.Errorf("failed to load S3 environment variables: %w", err)
 	}
-	if err := loadIAMEnvVars(&cfg.IAM, &cfg.S3); err != nil {
+	if err := loadIAMEnvVars(&cfg.S3.IAM, &cfg.S3); err != nil {
 		return nil, fmt.Errorf("failed to load IAM environment variables: %w", err)
 	}
 	if err := loadAdminEnvVars(&cfg.Admin); err != nil {
@@ -158,6 +156,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.OIDC.SessionCacheTTL == 0 {
 		cfg.OIDC.SessionCacheTTL = 15 * time.Minute
+	}
+	if cfg.OIDC.Scopes == "" {
+		cfg.OIDC.Scopes = "openid profile email eduPersonEntitlement"
 	}
 	if cfg.Policies.Directory == "" {
 		cfg.Policies.Directory = "./policies"
@@ -194,8 +195,8 @@ func (c *Config) Validate() error {
 	if c.S3.Region == "" {
 		return fmt.Errorf("s3.region is required")
 	}
-	if !c.S3.UseIAMRole && (c.S3.AccessKey == "" || c.S3.SecretKey == "") {
-		return fmt.Errorf("s3.access_key and s3.secret_key are required when not using IAM role")
+	if c.S3.IAM.AccessKey == "" || c.S3.IAM.SecretKey == "" {
+		return fmt.Errorf("s3.iam.access_key and s3.iam.secret_key are required")
 	}
 	return nil
 }
@@ -211,6 +212,9 @@ func loadOIDCEnvVars(oidcCfg *OIDCConfig) error {
 	}
 	if clientSecret := os.Getenv("OIDC_CLIENT_SECRET"); clientSecret != "" {
 		oidcCfg.ClientSecret = clientSecret
+	}
+	if scopes := os.Getenv("OIDC_SCOPES"); scopes != "" {
+		oidcCfg.Scopes = scopes
 	}
 	if rolesClaim := os.Getenv("OIDC_ROLES_CLAIM"); rolesClaim != "" {
 		oidcCfg.RolesClaim = rolesClaim
@@ -244,27 +248,6 @@ func loadS3EnvVars(s3cfg *S3Config) error {
 		s3cfg.Region = region
 	}
 
-	// Support both S3_ACCESS_KEY and AWS_ACCESS_KEY_ID
-	if accessKey := os.Getenv("S3_ACCESS_KEY"); accessKey != "" {
-		s3cfg.AccessKey = accessKey
-	} else if accessKey := os.Getenv("AWS_ACCESS_KEY_ID"); accessKey != "" {
-		s3cfg.AccessKey = accessKey
-	}
-
-	// Support both S3_SECRET_KEY and AWS_SECRET_ACCESS_KEY
-	if secretKey := os.Getenv("S3_SECRET_KEY"); secretKey != "" {
-		s3cfg.SecretKey = secretKey
-	} else if secretKey := os.Getenv("AWS_SECRET_ACCESS_KEY"); secretKey != "" {
-		s3cfg.SecretKey = secretKey
-	}
-
-	if useIAMRole := os.Getenv("S3_USE_IAM_ROLE"); useIAMRole != "" {
-		val, err := strconv.ParseBool(useIAMRole)
-		if err != nil {
-			return fmt.Errorf("invalid S3_USE_IAM_ROLE value: %w", err)
-		}
-		s3cfg.UseIAMRole = val
-	}
 	if forcePathStyle := os.Getenv("S3_FORCE_PATH_STYLE"); forcePathStyle != "" {
 		val, err := strconv.ParseBool(forcePathStyle)
 		if err != nil {
@@ -291,12 +274,6 @@ func loadIAMEnvVars(iamcfg *IAMConfig, s3cfg *S3Config) error {
 	}
 
 	// Default to S3 config values if IAM-specific values not provided
-	if iamcfg.AccessKey == "" {
-		iamcfg.AccessKey = s3cfg.AccessKey
-	}
-	if iamcfg.SecretKey == "" {
-		iamcfg.SecretKey = s3cfg.SecretKey
-	}
 	if iamcfg.Endpoint == "" {
 		iamcfg.Endpoint = s3cfg.Endpoint
 	}

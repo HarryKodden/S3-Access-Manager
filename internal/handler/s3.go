@@ -25,7 +25,7 @@ import (
 // S3Handler handles S3 proxy requests
 type S3Handler struct {
 	s3Client  *s3client.Client // Root client for admin operations only
-	s3Config  config.S3Config  // Config for creating user-specific clients
+	s3Config  config.S3Config  // S3 configuration for endpoint/region
 	credStore *store.CredentialStore
 	logger    *logrus.Logger
 }
@@ -60,6 +60,7 @@ func (h *S3Handler) createUserS3Client(ctx context.Context, cred *store.Credenti
 		if h.s3Config.Endpoint != "" && h.s3Config.Endpoint != "https://s3.amazonaws.com" {
 			o.BaseEndpoint = aws.String(h.s3Config.Endpoint)
 		}
+		// Use path style if configured
 		o.UsePathStyle = h.s3Config.ForcePathStyle
 	}
 
@@ -96,11 +97,13 @@ func (h *S3Handler) ProxyRequest(c *gin.Context) {
 	}
 
 	// Validate credential belongs to authenticated user
-	if cred.UserID != userInfo.Subject {
+	if cred.UserID != userInfo.Email {
 		h.logger.WithFields(logrus.Fields{
-			"user_id":      userInfo.Subject,
+			"user_email":   userInfo.Email,
 			"cred_user_id": cred.UserID,
 			"access_key":   accessKey,
+			"user_subject": userInfo.Subject,
+			"user_roles":   userInfo.Roles,
 		}).Warn("User attempted to use credential belonging to another user")
 		c.JSON(http.StatusForbidden, gin.H{"error": "Credential does not belong to you"})
 		return
@@ -137,8 +140,8 @@ func (h *S3Handler) ProxyRequest(c *gin.Context) {
 
 	// Create S3 client - use root client for local credentials (no backend), user client for real credentials
 	var s3Client *s3.Client
-	if cred.SessionToken != "" {
-		// Real STS credentials - create user-specific client
+	if cred.AccessKey != "" && cred.SecretKey != "" {
+		// Real AWS credentials (either permanent IAM keys or STS) - create user-specific client
 		userS3Client, err := h.createUserS3Client(c.Request.Context(), cred)
 		if err != nil {
 			h.logger.WithError(err).Error("Failed to create S3 client with user credentials")
@@ -343,7 +346,7 @@ func (h *S3Handler) handleListObjects(c *gin.Context, s3Client *s3.Client, bucke
 	})
 
 	if err != nil {
-		h.logger.WithError(err).Error("Failed to list objects from S3")
+		h.logger.WithError(err).WithField("bucket", bucket).Error("Failed to list objects from S3")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list objects"})
 		return
 	}

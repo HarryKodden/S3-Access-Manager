@@ -118,6 +118,11 @@ func discoverUserinfoEndpoint(ctx context.Context, issuer string) (string, error
 		return "", fmt.Errorf("userinfo_endpoint not found in discovery document")
 	}
 
+	// Ensure endpoint uses HTTPS if issuer is HTTPS
+	if strings.HasPrefix(issuer, "https://") && strings.HasPrefix(discovery.UserinfoEndpoint, "http://") {
+		discovery.UserinfoEndpoint = strings.Replace(discovery.UserinfoEndpoint, "http://", "https://", 1)
+	}
+
 	return discovery.UserinfoEndpoint, nil
 }
 
