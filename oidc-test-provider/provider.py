@@ -11,13 +11,21 @@ import jwt
 import os
 import sys
 import secrets
+import logging
 from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 PORT = 8888
 JWT_SECRET = "test-jwt-secret-key-do-not-use-in-production"
-# Use container name when running in docker, localhost otherwise
 ISSUER = os.getenv('ISSUER', f"http://localhost:{PORT}")
 CLIENT_ID = os.getenv('CLIENT_ID', "test-client")
 CLIENT_SECRET = os.getenv('CLIENT_SECRET', "test-secret")
@@ -30,34 +38,35 @@ TOKEN_DATA = {}
 
 class OIDCHandler(BaseHTTPRequestHandler):
     """OIDC provider HTTP handler"""
-    
+
     def log_message(self, format, *args):
-        """Log requests to stdout"""
-        print(f"[{self.log_date_time_string()}] {format % args}")
-    
+        """Log requests to stdout with INFO level"""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+        logger.info(f"{self.command} {self.path} - {client_ip} - {format % args}")
+
     def log_error(self, format, *args):
-        """Log errors, but suppress common connection errors"""
-        # Don't log full tracebacks for client disconnections
-        if isinstance(args[0] if args else None, str):
-            error_msg = str(args[0]) if args else format
-            if 'Broken pipe' in error_msg or 'Connection reset' in error_msg:
-                return  # Silently ignore client disconnections
-        print(f"[{self.log_date_time_string()}] ERROR: {format % args}")
-    
+        """Log errors with ERROR level"""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+        logger.error(f"{self.command} {self.path} - {client_ip} - {format % args}")
+
     def handle(self):
         """Handle request with error catching"""
         try:
             super().handle()
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             # Client disconnected - this is normal, don't log scary tracebacks
-            pass
+            client_ip = self.client_address[0] if self.client_address else 'unknown'
+            logger.debug(f"Client {client_ip} disconnected during request")
         except Exception as e:
-            print(f"[{self.log_date_time_string()}] Unexpected error: {e}")
+            client_ip = self.client_address[0] if self.client_address else 'unknown'
+            logger.error(f"Unexpected error handling request from {client_ip}: {e}", exc_info=True)
     
     def do_GET(self):
         """Handle GET requests"""
         parsed_path = urlparse(self.path)
-        
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+        logger.info(f"GET {parsed_path.path} from {client_ip}")
+
         if parsed_path.path == '/.well-known/openid-configuration':
             self.send_discovery_document()
         elif parsed_path.path == '/authorize':
@@ -67,20 +76,24 @@ class OIDCHandler(BaseHTTPRequestHandler):
         elif parsed_path.path == '/jwks':
             self.send_jwks()
         else:
+            logger.warning(f"404 Not Found: {parsed_path.path} from {client_ip}")
             self.send_response(404)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({"error": "not_found"}).encode())
-    
+
     def do_POST(self):
         """Handle POST requests"""
         parsed_path = urlparse(self.path)
-        
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+        logger.info(f"POST {parsed_path.path} from {client_ip}")
+
         if parsed_path.path == '/token':
             self.send_token()
         elif parsed_path.path == '/authorize':
             self.handle_authorize_post()
         else:
+            logger.warning(f"404 Not Found: {parsed_path.path} from {client_ip}")
             self.send_response(404)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -90,14 +103,18 @@ class OIDCHandler(BaseHTTPRequestHandler):
         """Handle authorization request - show login form"""
         parsed_path = urlparse(self.path)
         params = parse_qs(parsed_path.query)
-        
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+
         client_id = params.get('client_id', [''])[0]
         redirect_uri = params.get('redirect_uri', [''])[0]
         state = params.get('state', [''])[0]
         response_type = params.get('response_type', [''])[0]
         code_challenge = params.get('code_challenge', [''])[0]
-        
+
+        logger.info(f"Authorization request from {client_ip} - client_id: {client_id}, response_type: {response_type}")
+
         if not redirect_uri:
+            logger.error(f"Missing redirect_uri in authorization request from {client_ip}")
             self.send_response(400)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
@@ -243,19 +260,23 @@ class OIDCHandler(BaseHTTPRequestHandler):
     
     def handle_authorize_post(self):
         """Handle login form submission"""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+
         # Read POST data
         content_length = int(self.headers.get('Content-Length', 0))
         post_data = self.rfile.read(content_length).decode('utf-8')
         post_params = parse_qs(post_data)
-        
+
         username = post_params.get('username', [''])[0]
         roles_input = post_params.get('roles', ['admin'])[0]
-        
+
+        logger.info(f"Login attempt from {client_ip} - username: {username}, roles: {roles_input}")
+
         # Parse roles (comma-separated)
         roles = [role.strip() for role in roles_input.split(',') if role.strip()]
         if not roles:
             roles = ['user']  # Default role if none specified
-        
+
         # Accept any username (no password validation for testing)
         if username:
             # Get OAuth parameters from POST body (hidden form fields)
@@ -263,10 +284,10 @@ class OIDCHandler(BaseHTTPRequestHandler):
             redirect_uri = post_params.get('redirect_uri', [''])[0]
             state = post_params.get('state', [''])[0]
             code_challenge = post_params.get('code_challenge', [''])[0]
-            
+
             # Generate authorization code
             auth_code = secrets.token_urlsafe(32)
-            
+
             # Store code with associated data (expires in 5 minutes)
             AUTH_CODES[auth_code] = {
                 'client_id': client_id,
@@ -276,14 +297,17 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 'roles': roles,
                 'expires': datetime.now(timezone.utc) + timedelta(minutes=5)
             }
-            
+
+            logger.info(f"Login successful for {username} from {client_ip} - roles: {roles}, redirecting to: {redirect_uri}")
+
             # Redirect back to the application with the code
             redirect_url = f"{redirect_uri}?code={auth_code}&state={state}"
-            
+
             self.send_response(302)
             self.send_header('Location', redirect_url)
             self.end_headers()
         else:
+            logger.warning(f"Login failed from {client_ip} - username is required")
             # Invalid credentials - show error
             html = '''
 <!DOCTYPE html>
@@ -338,7 +362,9 @@ class OIDCHandler(BaseHTTPRequestHandler):
     
     def send_discovery_document(self):
         """Send OpenID Connect discovery document"""
-        
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+        logger.info(f"Discovery document requested from {client_ip}")
+
         discovery = {
             "issuer": ISSUER,
             "authorization_endpoint": f"{ISSUER}/authorize",
@@ -350,7 +376,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["HS256"],
         }
-        
+
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Access-Control-Allow-Origin', '*')
@@ -359,55 +385,65 @@ class OIDCHandler(BaseHTTPRequestHandler):
     
     def send_token(self):
         """Send access token and ID token"""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+
         # Read POST data
         content_length = int(self.headers.get('Content-Length', 0))
         post_data = self.rfile.read(content_length).decode('utf-8')
         params = parse_qs(post_data)
-        
+
         grant_type = params.get('grant_type', [''])[0]
-        
+        logger.info(f"Token request from {client_ip} - grant_type: {grant_type}")
+
         if grant_type == 'authorization_code':
             # Handle authorization code flow
             code = params.get('code', [''])[0]
-            
+
             if code not in AUTH_CODES:
+                logger.error(f"Invalid authorization code from {client_ip}: {code[:10]}...")
                 self.send_response(400)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": "invalid_grant"}).encode())
                 return
-            
+
             code_data = AUTH_CODES[code]
-            
+
             # Check if code is expired
             if datetime.now(timezone.utc) > code_data['expires']:
                 del AUTH_CODES[code]
+                logger.warning(f"Expired authorization code from {client_ip}: {code[:10]}...")
                 self.send_response(400)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": "expired_token"}).encode())
                 return
-            
+
             # Remove used code
             del AUTH_CODES[code]
-            
+
             # Set user data for authorization code
             user_email = code_data.get('username', '')
             user_roles = code_data.get('roles', [''])
-        
+            custom_claims = {}  # Initialize custom claims
+            logger.info(f"Token issued for {user_email} from {client_ip} - roles: {user_roles}")
+
         elif grant_type == 'client_credentials':
             # Handle client credentials flow
+            logger.info(f"Client credentials token request from {client_ip}")
+
             # Validate client credentials
             auth_header = self.headers.get('Authorization', '')
-            
+
             if not auth_header.startswith('Basic '):
                 # Check if client_id and client_secret are in form parameters
                 client_id = params.get('client_id', [''])[0]
                 client_secret = params.get('client_secret', [''])[0]
-                
+
                 if client_id != CLIENT_ID or client_secret != CLIENT_SECRET:
+                    logger.error(f"Invalid client credentials from {client_ip} - form params")
                     self.send_response(401)
                     self.send_header('Content-Type', 'application/json')
                     self.send_header('Access-Control-Allow-Origin', '*')
@@ -420,8 +456,9 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 try:
                     credentials = base64.b64decode(auth_header[6:]).decode('utf-8')
                     client_id, client_secret = credentials.split(':', 1)
-                    
+
                     if client_id != CLIENT_ID or client_secret != CLIENT_SECRET:
+                        logger.error(f"Invalid client credentials from {client_ip} - basic auth")
                         self.send_response(401)
                         self.send_header('Content-Type', 'application/json')
                         self.send_header('Access-Control-Allow-Origin', '*')
@@ -429,22 +466,23 @@ class OIDCHandler(BaseHTTPRequestHandler):
                         self.wfile.write(json.dumps({"error": "invalid_client"}).encode())
                         return
                 except Exception:
+                    logger.error(f"Failed to decode basic auth from {client_ip}")
                     self.send_response(401)
                     self.send_header('Content-Type', 'application/json')
                     self.send_header('Access-Control-Allow-Origin', '*')
                     self.end_headers()
                     self.wfile.write(json.dumps({"error": "invalid_client"}).encode())
                     return
-            
+
             # Set user data for client credentials
             user_email = CLIENT_ID
             user_roles = [""]
             custom_claims = {}
-            
+
             # Parse all form parameters for custom claims
             for param_name, param_values in params.items():
                 param_value = param_values[0] if param_values else ""
-                
+
                 if param_name == 'scope' and param_value:
                     # Parse scope for roles (e.g., "roles:admin,user")
                     scope_parts = param_value.split()
@@ -458,13 +496,16 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 elif param_value:
                     # Add any other parameter as a custom claim
                     custom_claims[param_name] = param_value
-            
+
             # Set email from custom claims if provided, otherwise use client_id
             if 'email' in custom_claims:
                 user_email = custom_claims['email']
                 del custom_claims['email']  # Remove from custom claims since it's handled separately
-        
+
+            logger.info(f"Client credentials token issued for {user_email} from {client_ip} - roles: {user_roles}")
+
         else:
+            logger.error(f"Unsupported grant type from {client_ip}: {grant_type}")
             self.send_response(400)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
@@ -482,12 +523,12 @@ class OIDCHandler(BaseHTTPRequestHandler):
             "email": user_email,
             ROLES_CLAIM: user_roles,
         }
-        
+
         # Add any custom claims
         payload.update(custom_claims)
-        
+
         token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
-        
+
         # Store token data for /userinfo endpoint
         TOKEN_DATA[token] = {
             'username': user_email,
@@ -496,17 +537,19 @@ class OIDCHandler(BaseHTTPRequestHandler):
             'sub': user_email,
             'expires': datetime.now(timezone.utc) + timedelta(hours=1)
         }
-        
+
         # Add custom claims to token data
         TOKEN_DATA[token].update(custom_claims)
-        
+
+        logger.info(f"Token generated for {user_email} from {client_ip} - token_id: {token[:20]}...")
+
         response = {
             "access_token": token,
             "token_type": "Bearer",
             "expires_in": 3600,
             "id_token": token,
         }
-        
+
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Access-Control-Allow-Origin', '*')
@@ -515,50 +558,58 @@ class OIDCHandler(BaseHTTPRequestHandler):
     
     def send_userinfo(self):
         """Send user info"""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+
         # Check for Authorization header
         auth_header = self.headers.get('Authorization', '')
-        
+
         if not auth_header.startswith('Bearer '):
+            logger.error(f"Missing or invalid Authorization header from {client_ip}")
             self.send_response(401)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({"error": "unauthorized"}).encode())
             return
-        
+
         # Extract token
         token = auth_header[7:]  # Remove 'Bearer ' prefix
-        
+
         # Look up token data
         if token in TOKEN_DATA:
             token_info = TOKEN_DATA[token]
-            
+
             # Check if token is expired
             if datetime.now(timezone.utc) > token_info['expires']:
                 del TOKEN_DATA[token]
+                logger.warning(f"Expired token used from {client_ip} - token: {token[:20]}...")
                 self.send_response(401)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": "token_expired"}).encode())
                 return
-            
+
+            user_email = token_info.get('email', '')
+            logger.info(f"Userinfo request from {client_ip} for user: {user_email}")
+
             userinfo = {
                 "sub": token_info['sub'],
                 "email": token_info['email'],
                 ROLES_CLAIM: token_info['roles'],
             }
-            
+
             # Add any custom claims from token data
             for key, value in token_info.items():
                 if key not in ['username', 'email', 'roles', 'sub', 'expires']:
                     userinfo[key] = value
         else:
             # Token not found, return unauthorized
+            logger.error(f"Invalid token used from {client_ip} - token: {token[:20]}...")
             self.send_response(401)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({"error": "token not valid"}).encode())
             return
-        
+
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Access-Control-Allow-Origin', '*')
@@ -567,50 +618,90 @@ class OIDCHandler(BaseHTTPRequestHandler):
     
     def send_jwks(self):
         """Send JSON Web Key Set"""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+        logger.info(f"JWKS requested from {client_ip}")
+
         jwks = {
             "keys": []
         }
-        
+
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         self.wfile.write(json.dumps(jwks).encode())
 
+def cleanup_expired_tokens():
+    """Clean up expired authorization codes and tokens"""
+    now = datetime.now(timezone.utc)
+    expired_codes = []
+    expired_tokens = []
+
+    for code, data in AUTH_CODES.items():
+        if now > data['expires']:
+            expired_codes.append(code)
+
+    for token, data in TOKEN_DATA.items():
+        if now > data['expires']:
+            expired_tokens.append(token)
+
+    for code in expired_codes:
+        del AUTH_CODES[code]
+
+    for token in expired_tokens:
+        del TOKEN_DATA[token]
+
+    if expired_codes or expired_tokens:
+        logger.info(f"Cleaned up {len(expired_codes)} expired auth codes and {len(expired_tokens)} expired tokens")
+
 def main():
     """Start the OIDC Provider server"""
-    print(f"🔧 Starting OIDCProvider Server")
-    print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print(f"Port: {PORT}")
-    print(f"Issuer: {ISSUER}")
-    print(f"Client ID: {CLIENT_ID}")
-    print(f"Client Secret: {CLIENT_SECRET}")
-    print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print()
-    print(f"✓ Discovery: {ISSUER}/.well-known/openid-configuration")
-    print(f"✓ Token: {ISSUER}/token")
-    print(f"✓ UserInfo: {ISSUER}/userinfo")
-    print(f"✓ JWKS: {ISSUER}/jwks")
-    print()
-    print("Configure your .env with:")
-    print(f"  ISSUER={ISSUER}")
-    print(f"  CLIENT_ID={CLIENT_ID}")
-    print(f"  CLIENT_SECRET={CLIENT_SECRET}")
-    print(f". ROLES_CLAIM={ROLES_CLAIM} (if different)")
-    print()
-    print("Press Ctrl+C to stop...")
-    print()
-    
+    logger.info("🔧 Starting OIDC Provider Server")
+    logger.info("=" * 50)
+    logger.info(f"Port: {PORT}")
+    logger.info(f"Issuer: {ISSUER}")
+    logger.info(f"Client ID: {CLIENT_ID}")
+    logger.info(f"Client Secret: {CLIENT_SECRET}")
+    logger.info(f"Roles Claim: {ROLES_CLAIM}")
+    logger.info("=" * 50)
+    logger.info(f"Discovery: {ISSUER}/.well-known/openid-configuration")
+    logger.info(f"Token: {ISSUER}/token")
+    logger.info(f"UserInfo: {ISSUER}/userinfo")
+    logger.info(f"JWKS: {ISSUER}/jwks")
+    logger.info("")
+    logger.info("Configure your .env with:")
+    logger.info(f"  ISSUER={ISSUER}")
+    logger.info(f"  CLIENT_ID={CLIENT_ID}")
+    logger.info(f"  CLIENT_SECRET={CLIENT_SECRET}")
+    logger.info(f"  ROLES_CLAIM={ROLES_CLAIM} (if different)")
+    logger.info("")
+    logger.info("Press Ctrl+C to stop...")
+    logger.info("")
+
     try:
         server = HTTPServer(('0.0.0.0', PORT), OIDCHandler)
+        logger.info("✓ Server started successfully")
+
+        # Clean up expired tokens every 5 minutes
+        import threading
+        def periodic_cleanup():
+            while True:
+                import time
+                time.sleep(300)  # 5 minutes
+                cleanup_expired_tokens()
+
+        cleanup_thread = threading.Thread(target=periodic_cleanup, daemon=True)
+        cleanup_thread.start()
+        logger.info("✓ Token cleanup thread started")
+
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n\n🛑 Shutting down OIDCProvider server...")
+        logger.info("🛑 Shutting down OIDC Provider server...")
         server.shutdown()
-        print("✓ Server stopped")
+        logger.info("✓ Server stopped")
         sys.exit(0)
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        logger.error(f"❌ Fatal error: {e}", exc_info=True)
         sys.exit(1)
 
 if __name__ == "__main__":

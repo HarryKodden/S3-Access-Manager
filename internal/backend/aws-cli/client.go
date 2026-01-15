@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/harrykodden/s3-gateway/internal/backend"
 	"github.com/sirupsen/logrus"
@@ -159,12 +158,84 @@ func (c *Client) CreateUser(email, displayName string) error {
 	return nil
 }
 
+// deleteExistingAccessKeys deletes all existing access keys for a user
+func (c *Client) deleteExistingAccessKeys(username string) error {
+	c.logger.WithField("username", username).Info("Listing existing access keys")
+
+	// List existing access keys
+	stdout, stderr, err := c.RunAwsCliCommand(
+		c.logger, "iam", "list-access-keys",
+		"--user-name", username,
+		"--output", "json",
+	)
+	if err != nil {
+		c.logger.WithError(err).WithField("stderr", string(stderr)).Error("Failed to list access keys")
+		return fmt.Errorf("failed to list access keys: %w (stderr: %s)", err, string(stderr))
+	}
+
+	c.logger.WithField("stdout", string(stdout)).Debug("Listed access keys successfully")
+
+	var accessKeysResult struct {
+		AccessKeyMetadata []struct {
+			AccessKeyId string `json:"AccessKeyId"`
+			Status      string `json:"Status"`
+		} `json:"AccessKeyMetadata"`
+	}
+	if err := json.Unmarshal(stdout, &accessKeysResult); err != nil {
+		c.logger.WithError(err).Error("Failed to parse access keys list")
+		return fmt.Errorf("failed to parse access keys list: %w", err)
+	}
+
+	c.logger.WithField("key_count", len(accessKeysResult.AccessKeyMetadata)).Info("Found existing access keys")
+
+	// Delete each access key
+	for _, key := range accessKeysResult.AccessKeyMetadata {
+		c.logger.WithFields(logrus.Fields{
+			"user":       username,
+			"access_key": key.AccessKeyId,
+			"status":     key.Status,
+		}).Info("Deleting existing access key")
+
+		_, stderr, err := c.RunAwsCliCommand(
+			c.logger, "iam", "delete-access-key",
+			"--user-name", username,
+			"--access-key-id", key.AccessKeyId,
+			"--output", "json",
+		)
+		if err != nil {
+			c.logger.WithError(err).WithField("access_key", key.AccessKeyId).WithField("stderr", string(stderr)).Warn("Failed to delete access key, continuing")
+		} else {
+			c.logger.WithField("access_key", key.AccessKeyId).Info("Successfully deleted access key")
+		}
+	}
+
+	if len(accessKeysResult.AccessKeyMetadata) > 0 {
+		c.logger.WithFields(logrus.Fields{
+			"user":      username,
+			"key_count": len(accessKeysResult.AccessKeyMetadata),
+		}).Info("Deleted existing access keys")
+	}
+
+	return nil
+}
+
 // CreateCredential creates access keys for IAM users
 func (c *Client) CreateCredential(email, credentialName string, policyDoc map[string]interface{}) (backend.CredentialInfo, error) {
+	c.logger.WithField("email", email).Info("Starting CreateCredential")
+
 	// Ensure IAM user exists
 	if err := c.CreateUser(email, ""); err != nil {
 		return backend.CredentialInfo{}, fmt.Errorf("failed to ensure user exists: %w", err)
 	}
+
+	c.logger.WithField("email", email).Info("User exists, deleting existing access keys")
+
+	// Delete existing access keys for the user (to avoid hitting the key limit)
+	if err := c.deleteExistingAccessKeys(email); err != nil {
+		c.logger.WithError(err).WithField("email", email).Warn("Failed to delete existing access keys, continuing anyway")
+	}
+
+	c.logger.WithField("email", email).Info("Creating new access key")
 
 	// Create access key for the user
 	stdout, stderr, err := c.RunAwsCliCommand(
@@ -487,15 +558,4 @@ func (c *Client) DeleteUser(ctx context.Context, username string) error {
 
 	c.logger.WithField("username", username).Info("Deleted IAM user via CLI")
 	return nil
-}
-
-// generateRandomString generates a random string of the specified length
-func generateRandomString(length int) string {
-	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, length)
-	for i := range b {
-		b[i] = charset[time.Now().UnixNano()%int64(len(charset))]
-		time.Sleep(1 * time.Nanosecond) // Simple way to get different random values
-	}
-	return string(b)
 }

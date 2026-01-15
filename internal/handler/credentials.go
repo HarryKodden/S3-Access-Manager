@@ -234,7 +234,6 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 
 	var accessKey, secretKey, sessionToken string
 	var roleName string
-	var err error
 	var credInfo backend.CredentialInfo
 
 	// Combine all policy documents into a single policy
@@ -483,56 +482,7 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 		})
 		return
 	}
-
-	// Store credential metadata locally
-	backendData := credInfo.BackendData
-	if backendData == nil {
-		backendData = make(map[string]interface{})
-	}
-
-	userID := userInfo.Email
-
-	cred, err := h.store.CreateWithKeys(userID, req.Name, req.Description, req.Roles, accessKey, secretKey, credInfo.SessionToken, roleName, backendData)
-	if err != nil {
-		h.logger.WithError(err).Error("Failed to store credential")
-		// Try to clean up the backend credential
-		if h.adminClient != nil {
-			backendData := credInfo.BackendData
-			if backendData == nil {
-				backendData = make(map[string]interface{})
-			}
-			_ = h.adminClient.DeleteCredential(userInfo.Email, req.Name, backendData)
-		} else if h.iamClient != nil {
-			username := userInfo.Email
-			_ = h.iamClient.DeleteAccessKey(c.Request.Context(), username, accessKey)
-		}
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store credential"})
-		return
-	}
-
-	h.logger.WithFields(logrus.Fields{
-		"user_id":    userInfo.Subject,
-		"user_email": userInfo.Email,
-		"cred_name":  req.Name,
-		"access_key": accessKey,
-	}).Info("Credential created")
-
-	// Return credential with secret key (only shown once)
-	c.JSON(http.StatusCreated, gin.H{
-		"credential": CredentialResponse{
-			ID:           cred.ID,
-			Name:         cred.Name,
-			AccessKey:    cred.AccessKey,
-			SecretKey:    cred.SecretKey,
-			SessionToken: cred.SessionToken,
-			CreatedAt:    cred.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
-			Description:  cred.Description,
-		},
-		"message": "Credential created successfully. Save the secret key securely - it won't be shown again.",
-	})
 }
-
-// DeleteCredential deletes a credential
 func (h *CredentialHandler) DeleteCredential(c *gin.Context) {
 	userInfo := h.getUserInfo(c)
 	if userInfo == nil {

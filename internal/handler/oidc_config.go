@@ -2,7 +2,6 @@ package handler
 
 import (
 	"net/http"
-	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/harrykodden/s3-gateway/internal/config"
@@ -29,11 +28,8 @@ type OIDCConfigResponse struct {
 
 // GetOIDCConfig returns the OIDC configuration for the frontend
 func (h *OIDCConfigHandler) GetOIDCConfig(c *gin.Context) {
-	// Convert internal Docker network URLs to external localhost URLs for frontend access
-	issuer := strings.Replace(h.config.OIDC.Issuer, "http://oidc:8888", "http://localhost:8888", 1)
-
 	response := OIDCConfigResponse{
-		Issuer:   issuer,
+		Issuer:   h.config.OIDC.Issuer,
 		ClientID: h.config.OIDC.ClientID,
 		Scopes:   h.config.OIDC.Scopes,
 	}

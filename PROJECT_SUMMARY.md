@@ -245,20 +245,20 @@ make test-container
 curl -X PUT \
   -H "Authorization: Bearer $TOKEN" \
   --data-binary @file.txt \
-  http://localhost:8080/bucket/key
+  http://localhost:9000/bucket/key
 
 # Download file
 curl -H "Authorization: Bearer $TOKEN" \
-  http://localhost:8080/bucket/key
+  http://localhost:9000/bucket/key
 
 # List bucket
 curl -H "Authorization: Bearer $TOKEN" \
-  http://localhost:8080/bucket
+  http://localhost:9000/bucket
 
 # Delete file
 curl -X DELETE \
   -H "Authorization: Bearer $TOKEN" \
-  http://localhost:8080/bucket/key
+  http://localhost:9000/bucket/key
 ```
 
 ## Policy Examples

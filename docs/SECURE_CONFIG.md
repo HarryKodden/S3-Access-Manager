@@ -28,7 +28,7 @@ Keep non-sensitive configuration in `config.yaml`:
 ```yaml
 server:
   host: "0.0.0.0"
-  port: 8080
+  port: 9000
   read_timeout: 30s
   write_timeout: 30s
 
@@ -123,7 +123,7 @@ docker run -d \
   -e S3_SECRET_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY \
   -e S3_REGION=us-east-1 \
   -v $(pwd)/config.yaml:/app/config.yaml \
-  -p 8080:8080 \
+  -p 9000:9000 \
   s3-gateway:latest
 ```
 
@@ -139,7 +139,7 @@ services:
     volumes:
       - ./config.yaml:/app/config.yaml
     ports:
-      - "8080:8080"
+      - "9000:9000"
 ```
 
 ### Production (Kubernetes)

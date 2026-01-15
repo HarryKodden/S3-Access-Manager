@@ -203,7 +203,7 @@ The implementation works with any OpenID Connect compliant provider:
 
 ```bash
 # Via gateway
-curl http://localhost:8080/oidc-config
+curl http://localhost:9000/oidc-config
 
 # Via frontend proxy
 curl http://localhost:8081/api/oidc-config

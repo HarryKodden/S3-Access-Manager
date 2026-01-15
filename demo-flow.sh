@@ -6,7 +6,7 @@
 set -e  # Exit on any error
 
 # Configuration
-GATEWAY_URL="http://localhost"
+GATEWAY_URL="http://localhost:9000"
 OIDC_URL="http://localhost:8888"
 CLIENT_ID="test-client"
 CLIENT_SECRET="test-secret"

@@ -54,7 +54,7 @@ GET /s3/{bucket}?prefix=path/&delimiter=/
 ```
 ```bash
 curl -H "Authorization: Bearer $TOKEN" \
-     http://localhost:8080/s3/my-bucket/files/document.pdf \
+     http://localhost:9000/s3/my-bucket/files/document.pdf \
      -o document.pdf
 ```
 ## Credential Management Endpoints

@@ -370,7 +370,7 @@ async function fetchOIDCConfiguration() {
         }
         
         const oidcConfig = await response.json();
-        
+              
         // Store configuration
         localStorage.setItem(CONFIG.oidcStorage, JSON.stringify(oidcConfig));
         

@@ -340,7 +340,7 @@ TOKEN="eyJhbGc..."
 
 # Test access
 curl -H "Authorization: Bearer $TOKEN" \
-     http://localhost:8080/my-bucket/dev/test.txt
+     http://localhost:9000/my-bucket/dev/test.txt
 ```
 
 Check logs for policy evaluation:
