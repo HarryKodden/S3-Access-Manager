@@ -17,7 +17,7 @@
 - 🌐 **S3 Browser**: Visual file management with upload/download
 - 📈 **Prometheus Metrics**: Built-in monitoring endpoint
 - 🐳 **Docker Ready**: Complete containerization
-- 🏗️ **Multi-Backend Support**: MinIO, AWS S3, CEPH RadosGW
+- 🏗️ **AWS CLI Backend**: AWS S3 integration with CLI-based operations
 - 🧪 **Integration Tests**: Automated testing with OIDC simulation
 
 ## Architecture
@@ -31,7 +31,7 @@ Key components:
 - **Policy Engine**: Enforces access control based on user roles
 - **Credential Delegation**: Users create S3 keys with subset of their permissions
 - **S3 Proxy**: Signs and forwards requests to S3 backends
-- **Backend Integration**: Syncs users/policies with MinIO/AWS/CEPH
+- **AWS CLI Backend**: Manages users/policies via AWS CLI commands
 
 ## Quick Start
 
@@ -69,7 +69,6 @@ IAM_SECRET_KEY=your-admin-secret-key
 3. **Configure S3 backend in config.yaml:**
 ```yaml
 s3:
-  backend: "minio"  # minio, aws, ceph
   endpoint: "${S3_ENDPOINT}"
   region: "${S3_REGION}"
   iam:
@@ -95,13 +94,11 @@ Access at `http://localhost`:
 
 ## Backend Support
 
-### Supported Backends
-- ✅ **MinIO**: Full S3-compatible with user/policy management
-- ✅ **AWS S3**: IAM integration and cross-account access
-- ✅ **CEPH RadosGW**: RadosGW user and bucket management
+### Supported Backend
+- ✅ **AWS CLI**: AWS S3 with CLI-based user and policy management
 
 ### Configuration
-Set `s3.backend` in config.yaml to `minio`, `aws`, or `ceph`.
+The gateway uses AWS CLI for backend operations. Configure IAM credentials for admin operations.
 
 ## Policy Configuration
 
@@ -195,17 +192,12 @@ make build
 ### Integration Testing
 
 ```bash
-# Install test dependencies
-pip install -r test/test_requirements.txt
-
 # Start services
 docker compose up -d
 
 # Run tests
-python test/test_lifecycle.py
+./demo-flow.sh
 
-# Or with Docker
-docker compose run --rm test-lifecycle
 ```
 
 ## License

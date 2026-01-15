@@ -172,16 +172,25 @@ func (h *CredentialHandler) ListCredentials(c *gin.Context) {
 
 // CreateCredential creates a new credential for the authenticated user
 func (h *CredentialHandler) CreateCredential(c *gin.Context) {
+	h.logger.Info("CreateCredential handler called")
+
 	userInfo := h.getUserInfo(c)
 	if userInfo == nil {
 		return
 	}
+
+	h.logger.WithField("email", userInfo.Email).Info("Processing credential creation")
 
 	var req CreateCredentialRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request: " + err.Error()})
 		return
 	}
+
+	h.logger.WithFields(logrus.Fields{
+		"email": userInfo.Email,
+		"roles": req.Roles,
+	}).Info("Credential creation request validated")
 
 	// Resolve roles to policies and get policy documents
 	policyNames := h.roleStore.GetPoliciesForRoles(req.Roles)
@@ -223,7 +232,7 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 		}
 	}
 
-	var accessKey, secretKey string
+	var accessKey, secretKey, sessionToken string
 	var roleName string
 	var err error
 	var credInfo backend.CredentialInfo
@@ -255,6 +264,12 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 
 		accessKey = credInfo.AccessKey
 		secretKey = credInfo.SecretKey
+		sessionToken := credInfo.SessionToken
+
+		roleName = ""
+		if rn, ok := credInfo.BackendData["role_name"].(string); ok {
+			roleName = rn
+		}
 
 		h.logger.WithFields(logrus.Fields{
 			"user_email":   userInfo.Email,
@@ -262,6 +277,48 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 			"policy_count": len(policyDocuments),
 			"access_key":   accessKey,
 		}).Info("Backend credential created with combined policy")
+
+		// Store credential metadata locally
+		backendData := credInfo.BackendData
+		if backendData == nil {
+			backendData = make(map[string]interface{})
+		}
+
+		userID := userInfo.Email
+
+		cred, err := h.store.CreateWithKeys(userID, req.Name, req.Description, req.Roles, accessKey, secretKey, sessionToken, roleName, backendData)
+		if err != nil {
+			h.logger.WithError(err).Error("Failed to store credential")
+			// Try to clean up the backend credential
+			if backendData == nil {
+				backendData = make(map[string]interface{})
+			}
+			_ = h.adminClient.DeleteCredential(userInfo.Email, req.Name, backendData)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store credential"})
+			return
+		}
+
+		h.logger.WithFields(logrus.Fields{
+			"user_id":    userInfo.Subject,
+			"user_email": userInfo.Email,
+			"cred_name":  req.Name,
+			"access_key": accessKey,
+		}).Info("Credential created")
+
+		// Return credential with secret key (only shown once)
+		c.JSON(http.StatusCreated, gin.H{
+			"credential": CredentialResponse{
+				ID:           cred.ID,
+				Name:         cred.Name,
+				AccessKey:    cred.AccessKey,
+				SecretKey:    cred.SecretKey,
+				SessionToken: cred.SessionToken,
+				CreatedAt:    cred.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+				Description:  cred.Description,
+			},
+			"message": "Credential created successfully. Save the secret key securely - it won't be shown again.",
+		})
+		return
 	} else if h.iamClient != nil {
 		// Use STS AssumeRole to create temporary credentials instead of permanent access keys
 		username := userInfo.Email
@@ -333,7 +390,7 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 		}
 
 		// Assume the role to get temporary credentials
-		accessKey, secretKey, sessionToken, err := h.iamClient.AssumeRole(c.Request.Context(), roleArn, fmt.Sprintf("%s-session-%s", username, req.Name), 3600) // 1 hour duration
+		tempAccessKey, tempSecretKey, tempSessionToken, err := h.iamClient.AssumeRole(c.Request.Context(), roleArn, fmt.Sprintf("%s-session-%s", username, req.Name), 3600) // 1 hour duration
 		if err != nil {
 			h.logger.WithError(err).WithFields(logrus.Fields{
 				"username":  username,
@@ -344,11 +401,15 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 			return
 		}
 
+		accessKey = tempAccessKey
+		secretKey = tempSecretKey
+		sessionToken = tempSessionToken
+
 		// For IAM, we don't have backend-specific data to store
 		credInfo = backend.CredentialInfo{
-			AccessKey:    accessKey,
-			SecretKey:    secretKey,
-			SessionToken: sessionToken,
+			AccessKey:    tempAccessKey,
+			SecretKey:    tempSecretKey,
+			SessionToken: tempSessionToken,
 		}
 
 		h.logger.WithFields(logrus.Fields{
@@ -358,6 +419,46 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 			"selected_roles": req.Roles,
 			"access_key":     accessKey,
 		}).Info("Temporary credentials created via STS AssumeRole")
+
+		// Store credential metadata locally
+		backendData := credInfo.BackendData
+		if backendData == nil {
+			backendData = make(map[string]interface{})
+		}
+
+		userID := userInfo.Email
+
+		cred, err := h.store.CreateWithKeys(userID, req.Name, req.Description, req.Roles, accessKey, secretKey, sessionToken, roleName, backendData)
+		if err != nil {
+			h.logger.WithError(err).Error("Failed to store credential")
+			// Try to clean up the backend credential
+			username := userInfo.Email
+			_ = h.iamClient.DeleteAccessKey(c.Request.Context(), username, accessKey)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store credential"})
+			return
+		}
+
+		h.logger.WithFields(logrus.Fields{
+			"user_id":    userInfo.Subject,
+			"user_email": userInfo.Email,
+			"cred_name":  req.Name,
+			"access_key": accessKey,
+		}).Info("Credential created")
+
+		// Return credential with secret key (only shown once)
+		c.JSON(http.StatusCreated, gin.H{
+			"credential": CredentialResponse{
+				ID:           cred.ID,
+				Name:         cred.Name,
+				AccessKey:    cred.AccessKey,
+				SecretKey:    cred.SecretKey,
+				SessionToken: cred.SessionToken,
+				CreatedAt:    cred.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+				Description:  cred.Description,
+			},
+			"message": "Credential created successfully. Save the secret key securely - it won't be shown again.",
+		})
+		return
 	} else {
 		// No backend configured - generate local keys only (for testing)
 		h.logger.Warn("No CEPH or IAM backend configured, generating local keys only")

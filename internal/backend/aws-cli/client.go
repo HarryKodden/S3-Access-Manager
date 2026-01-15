@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/harrykodden/s3-gateway/internal/backend"
 	"github.com/sirupsen/logrus"
@@ -14,7 +16,11 @@ import (
 
 // Client handles AWS operations via AWS CLI
 type Client struct {
-	logger *logrus.Logger
+	logger    *logrus.Logger
+	accountID string
+	callerArn string
+	accessKey string
+	secretKey string
 }
 
 // NewClient creates a new AWS CLI client and sets up AWS config files
@@ -62,9 +68,42 @@ aws_secret_access_key = %s
 		"region":      region,
 	}).Info("AWS CLI configuration created")
 
-	return &Client{
-		logger: logger,
-	}, nil
+	c := &Client{
+		logger:    logger,
+		accessKey: accessKey,
+		secretKey: secretKey,
+	}
+
+	// Get caller identity
+	stdout, stderr, err := c.RunAwsCliCommand(logger, "sts", "get-caller-identity", "--output", "json")
+	if err != nil {
+		logger.WithFields(logrus.Fields{
+			"error":  err,
+			"stderr": string(stderr),
+		}).Warn("Failed to get caller identity, proceeding without account info")
+		c.accountID = ""
+		c.callerArn = ""
+	} else {
+		var identity struct {
+			Account string `json:"Account"`
+			Arn     string `json:"Arn"`
+		}
+		if err := json.Unmarshal(stdout, &identity); err != nil {
+			logger.WithError(err).Warn("Failed to parse caller identity")
+			c.accountID = ""
+			c.callerArn = ""
+		} else {
+			c.accountID = identity.Account
+			c.callerArn = identity.Arn
+
+			logger.WithFields(logrus.Fields{
+				"account_id": identity.Account,
+				"caller_arn": identity.Arn,
+			}).Info("Retrieved AWS account information")
+		}
+	}
+
+	return c, nil
 }
 
 // GetBackendType returns the backend type
@@ -99,146 +138,169 @@ func (c *Client) RunAwsCliCommand(logger *logrus.Logger, args ...string) ([]byte
 	return stdout, nil, nil
 }
 
-// CreateUser creates an IAM user if it doesn't exist
+// CreateUser creates a user in the backend
 func (c *Client) CreateUser(email, displayName string) error {
-	username := email
-
-	// Check if user exists first
-	_, _, err := c.RunAwsCliCommand(c.logger, "iam", "get-user", "--user-name", username, "--output", "json")
-	if err == nil {
-		c.logger.WithField("username", username).Debug("IAM user already exists")
-		return nil
-	}
-
 	// Create IAM user
 	_, stderr, err := c.RunAwsCliCommand(
-		c.logger, "iam", "create-user", "--user-name", username,
-		"--tags", fmt.Sprintf("Key=Email,Value=%s", email),
-		fmt.Sprintf("Key=DisplayName,Value=%s", displayName),
-		"Key=ManagedBy,Value=S3Gateway",
+		c.logger, "iam", "create-user",
+		"--user-name", email,
 		"--output", "json",
 	)
 	if err != nil {
+		// Check if user already exists (this is not an error)
+		if strings.Contains(string(stderr), "EntityAlreadyExists") {
+			c.logger.WithField("email", email).Debug("IAM user already exists")
+			return nil
+		}
 		return fmt.Errorf("failed to create IAM user: %w (stderr: %s)", err, string(stderr))
 	}
 
-	c.logger.WithFields(logrus.Fields{
-		"username": username,
-		"email":    email,
-	}).Info("Created IAM user via CLI")
-
+	c.logger.WithField("email", email).Info("Created IAM user")
 	return nil
 }
 
-// CreateCredential creates an IAM access key for the user
+// CreateCredential creates access keys for IAM users
 func (c *Client) CreateCredential(email, credentialName string, policyDoc map[string]interface{}) (backend.CredentialInfo, error) {
-	username := email
-
-	// Create IAM policy for this credential
-	policyName := fmt.Sprintf("%s-%s-policy", username, credentialName)
-	policyJSON, err := json.Marshal(policyDoc)
-	if err != nil {
-		return backend.CredentialInfo{}, fmt.Errorf("failed to marshal policy: %w", err)
+	// Ensure IAM user exists
+	if err := c.CreateUser(email, ""); err != nil {
+		return backend.CredentialInfo{}, fmt.Errorf("failed to ensure user exists: %w", err)
 	}
 
-	// Write policy to temp file
-	tmpFile, err := os.CreateTemp("", "policy-*.json")
-	if err != nil {
-		return backend.CredentialInfo{}, fmt.Errorf("failed to create temp file: %w", err)
-	}
-	defer os.Remove(tmpFile.Name())
-
-	if _, err := tmpFile.Write(policyJSON); err != nil {
-		return backend.CredentialInfo{}, fmt.Errorf("failed to write policy: %w", err)
-	}
-	tmpFile.Close()
-
-	// Create policy
-	_, stderr, err := c.RunAwsCliCommand(
-		c.logger, "iam", "put-user-policy",
-		"--policy-name", policyName,
-		"--policy-document", fmt.Sprintf("file://%s", tmpFile.Name()),
-		"--user-name", username,
-		"--output", "json",
-	)
-	if err != nil {
-		return backend.CredentialInfo{}, fmt.Errorf("failed to create IAM policy: %w (stderr: %s)", err, string(stderr))
-	}
-
-	// Create access key
+	// Create access key for the user
 	stdout, stderr, err := c.RunAwsCliCommand(
 		c.logger, "iam", "create-access-key",
-		"--user-name", username,
+		"--user-name", email,
 		"--output", "json",
 	)
 	if err != nil {
 		return backend.CredentialInfo{}, fmt.Errorf("failed to create access key: %w (stderr: %s)", err, string(stderr))
 	}
 
-	var keyResult struct {
+	var accessKeyResult struct {
 		AccessKey struct {
 			AccessKeyId     string `json:"AccessKeyId"`
 			SecretAccessKey string `json:"SecretAccessKey"`
+			Status          string `json:"Status"`
 		} `json:"AccessKey"`
 	}
-	if err := json.Unmarshal(stdout, &keyResult); err != nil {
+	if err := json.Unmarshal(stdout, &accessKeyResult); err != nil {
 		return backend.CredentialInfo{}, fmt.Errorf("failed to parse access key output: %w", err)
 	}
 
+	// Attach policy to user
+	policyJSON, err := json.Marshal(policyDoc)
+	if err != nil {
+		return backend.CredentialInfo{}, fmt.Errorf("failed to marshal policy: %w", err)
+	}
+
+	policyFile, err := os.CreateTemp("", "policy-*.json")
+	if err != nil {
+		return backend.CredentialInfo{}, fmt.Errorf("failed to create policy temp file: %w", err)
+	}
+	defer os.Remove(policyFile.Name())
+
+	if _, err := policyFile.Write(policyJSON); err != nil {
+		return backend.CredentialInfo{}, fmt.Errorf("failed to write policy: %w", err)
+	}
+	policyFile.Close()
+
+	policyName := fmt.Sprintf("%s-%s-policy", email, credentialName)
+	_, stderr, err = c.RunAwsCliCommand(
+		c.logger, "iam", "put-user-policy",
+		"--user-name", email,
+		"--policy-name", policyName,
+		"--policy-document", fmt.Sprintf("file://%s", policyFile.Name()),
+		"--output", "json",
+	)
+	if err != nil {
+		return backend.CredentialInfo{}, fmt.Errorf("failed to attach policy to user: %w (stderr: %s)", err, string(stderr))
+	}
+
 	c.logger.WithFields(logrus.Fields{
-		"username":   username,
-		"access_key": keyResult.AccessKey.AccessKeyId,
-	}).Info("Created IAM access key via CLI")
+		"user":        email,
+		"credential":  credentialName,
+		"access_key":  accessKeyResult.AccessKey.AccessKeyId,
+		"policy_name": policyName,
+	}).Info("Created IAM access key and attached policy")
 
 	return backend.CredentialInfo{
-		AccessKey: keyResult.AccessKey.AccessKeyId,
-		SecretKey: keyResult.AccessKey.SecretAccessKey,
+		AccessKey: accessKeyResult.AccessKey.AccessKeyId,
+		SecretKey: accessKeyResult.AccessKey.SecretAccessKey,
+		BackendData: map[string]interface{}{
+			"type":        "iam-user",
+			"user":        email,
+			"credential":  credentialName,
+			"policy_name": policyName,
+		},
 	}, nil
 }
 
-// UpdateCredential updates an IAM access key's policy
+// UpdateCredential updates an IAM user's policy
 func (c *Client) UpdateCredential(email, credentialName string, policyDoc map[string]interface{}, backendData map[string]interface{}) (map[string]interface{}, error) {
-	err := c.DeleteCredential(email, credentialName, backendData)
-	if err != nil {
-		return nil, err
+
+	policyName, ok := backendData["policy_name"].(string)
+	if !ok {
+		return nil, fmt.Errorf("policy_name not found in backendData")
 	}
-	credInfo, err := c.CreateCredential(email, credentialName, policyDoc)
+
+	// Update the policy
+	policyJSON, err := json.Marshal(policyDoc)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to marshal policy: %w", err)
 	}
-	return credInfo.BackendData, nil
+
+	policyFile, err := os.CreateTemp("", "policy-*.json")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create policy temp file: %w", err)
+	}
+	defer os.Remove(policyFile.Name())
+
+	if _, err := policyFile.Write(policyJSON); err != nil {
+		return nil, fmt.Errorf("failed to write policy: %w", err)
+	}
+	policyFile.Close()
+
+	_, stderr, err := c.RunAwsCliCommand(
+		c.logger, "iam", "put-user-policy",
+		"--user-name", email,
+		"--policy-name", policyName,
+		"--policy-document", fmt.Sprintf("file://%s", policyFile.Name()),
+		"--output", "json",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to update user policy: %w (stderr: %s)", err, string(stderr))
+	}
+
+	return backendData, nil
 }
 
-// DeleteCredential deletes an IAM access key and associated policy
+// DeleteCredential deletes an IAM user's policy and access keys
 func (c *Client) DeleteCredential(email, credentialName string, backendData map[string]interface{}) error {
-	username := email
 
-	// Detach and delete the policy if we have the ARN
-	if policyArn, ok := backendData["policy_arn"].(string); ok && policyArn != "" {
-		// Detach policy
-		cmd := exec.Command("aws", "iam", "detach-user-policy",
-			"--user-name", username,
-			"--policy-arn", policyArn)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			c.logger.WithError(err).WithField("output", string(output)).Warn("Failed to detach policy")
-		}
-
-		// Delete policy
-		cmd = exec.Command("aws", "iam", "delete-policy",
-			"--policy-arn", policyArn)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			c.logger.WithError(err).WithField("output", string(output)).Warn("Failed to delete policy")
-		}
+	policyName, ok := backendData["policy_name"].(string)
+	if !ok {
+		return fmt.Errorf("policy_name not found in backendData")
 	}
 
-	// List and delete all access keys
+	// Delete the user policy
+	_, stderr, err := c.RunAwsCliCommand(
+		c.logger, "iam", "delete-user-policy",
+		"--user-name", email,
+		"--policy-name", policyName,
+	)
+	if err != nil {
+		c.logger.WithError(err).WithField("stderr", string(stderr)).Warn("Failed to delete user policy")
+	}
+
+	// Delete all access keys for the user (in case there are multiple)
 	stdout, stderr, err := c.RunAwsCliCommand(
 		c.logger, "iam", "list-access-keys",
-		"--user-name", username,
-		"--output", "json")
-
+		"--user-name", email,
+		"--output", "json",
+	)
 	if err != nil {
-		return fmt.Errorf("failed to list access keys: %w (stderr: %s)", err, string(stderr))
+		c.logger.WithError(err).WithField("stderr", string(stderr)).Warn("Failed to list access keys")
+		return nil // Don't fail the deletion if we can't list keys
 	}
 
 	var keysResult struct {
@@ -247,19 +309,22 @@ func (c *Client) DeleteCredential(email, credentialName string, backendData map[
 		} `json:"AccessKeyMetadata"`
 	}
 	if err := json.Unmarshal(stdout, &keysResult); err != nil {
-		return fmt.Errorf("failed to parse access keys: %w", err)
+		c.logger.WithError(err).Warn("Failed to parse access keys")
+		return nil
 	}
 
+	// Delete all access keys
 	for _, key := range keysResult.AccessKeyMetadata {
-		_, stderr, err := c.RunAwsCliCommand(
+		_, stderr, err = c.RunAwsCliCommand(
 			c.logger, "iam", "delete-access-key",
-			"--user-name", username,
-			"--access-key-id", key.AccessKeyId)
+			"--user-name", email,
+			"--access-key-id", key.AccessKeyId,
+		)
 		if err != nil {
 			c.logger.WithError(err).WithFields(logrus.Fields{
 				"access_key": key.AccessKeyId,
-				"output":     string(stderr),
-			}).Error("Failed to delete access key")
+				"stderr":     string(stderr),
+			}).Warn("Failed to delete access key")
 		}
 	}
 
@@ -422,4 +487,15 @@ func (c *Client) DeleteUser(ctx context.Context, username string) error {
 
 	c.logger.WithField("username", username).Info("Deleted IAM user via CLI")
 	return nil
+}
+
+// generateRandomString generates a random string of the specified length
+func generateRandomString(length int) string {
+	const charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	b := make([]byte, length)
+	for i := range b {
+		b[i] = charset[time.Now().UnixNano()%int64(len(charset))]
+		time.Sleep(1 * time.Nanosecond) // Simple way to get different random values
+	}
+	return string(b)
 }

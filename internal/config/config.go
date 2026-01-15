@@ -47,8 +47,6 @@ type OIDCConfig struct {
 type IAMConfig struct {
 	AccessKey string `yaml:"access_key"`
 	SecretKey string `yaml:"secret_key"`
-	Endpoint  string `yaml:"endpoint"`
-	Region    string `yaml:"region"`
 }
 
 // S3Config contains S3 backend settings
@@ -265,20 +263,6 @@ func loadIAMEnvVars(iamcfg *IAMConfig, s3cfg *S3Config) error {
 	}
 	if secretKey := os.Getenv("IAM_SECRET_KEY"); secretKey != "" {
 		iamcfg.SecretKey = secretKey
-	}
-	if endpoint := os.Getenv("IAM_ENDPOINT"); endpoint != "" {
-		iamcfg.Endpoint = endpoint
-	}
-	if region := os.Getenv("IAM_REGION"); region != "" {
-		iamcfg.Region = region
-	}
-
-	// Default to S3 config values if IAM-specific values not provided
-	if iamcfg.Endpoint == "" {
-		iamcfg.Endpoint = s3cfg.Endpoint
-	}
-	if iamcfg.Region == "" {
-		iamcfg.Region = s3cfg.Region
 	}
 
 	return nil

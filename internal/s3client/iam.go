@@ -32,21 +32,21 @@ type AccessKeyInfo struct {
 }
 
 // NewIAMClient creates a new IAM client with IAM-specific credentials
-func NewIAMClient(cfg config.IAMConfig, logger *logrus.Logger) (*IAMClient, error) {
+func NewIAMClient(cfg config.S3Config, logger *logrus.Logger) (*IAMClient, error) {
 	ctx := context.Background()
 
 	accessPrefix := ""
-	if len(cfg.AccessKey) > 5 {
-		accessPrefix = cfg.AccessKey[:5]
-	} else if len(cfg.AccessKey) > 0 {
-		accessPrefix = cfg.AccessKey
+	if len(cfg.IAM.AccessKey) > 5 {
+		accessPrefix = cfg.IAM.AccessKey[:5]
+	} else if len(cfg.IAM.AccessKey) > 0 {
+		accessPrefix = cfg.IAM.AccessKey
 	}
 
 	logger.WithFields(logrus.Fields{
 		"endpoint":      cfg.Endpoint,
 		"region":        cfg.Region,
-		"has_access":    cfg.AccessKey != "",
-		"has_secret":    cfg.SecretKey != "",
+		"has_access":    cfg.IAM.AccessKey != "",
+		"has_secret":    cfg.IAM.SecretKey != "",
 		"access_prefix": accessPrefix,
 	}).Info("Initializing IAM client")
 
@@ -54,8 +54,8 @@ func NewIAMClient(cfg config.IAMConfig, logger *logrus.Logger) (*IAMClient, erro
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
 		awsconfig.WithRegion(cfg.Region),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			cfg.AccessKey,
-			cfg.SecretKey,
+			cfg.IAM.AccessKey,
+			cfg.IAM.SecretKey,
 			"",
 		)),
 	)

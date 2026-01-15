@@ -100,7 +100,7 @@ func main() {
 	authenticator.StartSessionCleanup(cleanupCtx)
 
 	// Initialize S3 client
-	s3Client, err := s3client.NewClient(cfg.S3.IAM, logger)
+	s3Client, err := s3client.NewClient(cfg.S3, logger)
 	if err != nil {
 		logger.WithError(err).Fatal("Failed to initialize S3 client")
 	}
@@ -108,17 +108,25 @@ func main() {
 	// Initialize IAM client with IAM-specific credentials
 	// Only initialize for backends that support IAM operations
 	var iamClient *s3client.IAMClient
-	iamClient, err = s3client.NewIAMClient(cfg.S3.IAM, logger)
 
 	// Initialize backend-specific admin client based on backend type
 	var adminClient backend.AdminClient
 
-	awsCliClient, err := awscli.NewClient(cfg.S3.Endpoint, cfg.S3.IAM.AccessKey, cfg.S3.IAM.SecretKey, cfg.S3.IAM.Region, logger)
+	awsCliClient, err := awscli.NewClient(cfg.S3.Endpoint, cfg.S3.IAM.AccessKey, cfg.S3.IAM.SecretKey, cfg.S3.Region, logger)
 	if err != nil {
-		logger.WithError(err).Warn("Failed to initialize AWS CLI client, using local keys only")
+		logger.WithError(err).Warn("Failed to initialize AWS CLI client, using local credentials only")
+		// When no backend is configured, don't initialize IAM client
+		iamClient = nil
 	} else {
 		adminClient = awsCliClient
 		logger.WithField("backend", "aws-cli").Info("AWS CLI client initialized")
+
+		// Only initialize IAM client when backend is available
+		iamClient, err = s3client.NewIAMClient(cfg.S3, logger)
+		if err != nil {
+			logger.WithError(err).Warn("Failed to initialize IAM client")
+			iamClient = nil
+		}
 	}
 
 	// Initialize user manager based on backend
@@ -212,12 +220,13 @@ func main() {
 	}
 
 	// S3 proxy endpoints - users must be authenticated and select a credential
-	s3Handler := handler.NewS3Handler(s3Client, cfg.S3, credStore, logger)
+	s3Handler := handler.NewS3Handler(s3Client, cfg.S3, credStore, policyEngine, logger)
 
-	// S3 routes - require OIDC authentication + credential selection
+	// S3 routes - require OIDC authentication + credential selection + user/policy sync
 	// Use /s3/ prefix to avoid conflicts with other routes
 	s3Routes := router.Group("/s3")
 	s3Routes.Use(authMiddleware) // OIDC authentication
+	s3Routes.Use(syncMiddleware) // Sync IAM user/policies after auth
 	{
 		// Match all S3-like paths: /s3/{bucket}/{key...}
 		// Frontend must send X-S3-Credential-AccessKey header with selected credential

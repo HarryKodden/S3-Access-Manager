@@ -11,6 +11,7 @@ import (
 
 	"github.com/harrykodden/s3-gateway/internal/auth"
 	"github.com/harrykodden/s3-gateway/internal/config"
+	"github.com/harrykodden/s3-gateway/internal/policy"
 	"github.com/harrykodden/s3-gateway/internal/s3client"
 	"github.com/harrykodden/s3-gateway/internal/store"
 
@@ -24,47 +25,85 @@ import (
 
 // S3Handler handles S3 proxy requests
 type S3Handler struct {
-	s3Client  *s3client.Client // Root client for admin operations only
-	s3Config  config.S3Config  // S3 configuration for endpoint/region
-	credStore *store.CredentialStore
-	logger    *logrus.Logger
+	s3Client     *s3client.Client // Root client for admin operations only
+	s3Config     config.S3Config  // S3 configuration for endpoint/region
+	credStore    *store.CredentialStore
+	policyEngine *policy.Engine
+	logger       *logrus.Logger
 }
 
 // NewS3Handler creates a new S3 handler
-func NewS3Handler(client *s3client.Client, s3Cfg config.S3Config, credStore *store.CredentialStore, logger *logrus.Logger) *S3Handler {
+func NewS3Handler(client *s3client.Client, s3Cfg config.S3Config, credStore *store.CredentialStore, policyEngine *policy.Engine, logger *logrus.Logger) *S3Handler {
 	return &S3Handler{
-		s3Client:  client,
-		s3Config:  s3Cfg,
-		credStore: credStore,
-		logger:    logger,
+		s3Client:     client,
+		s3Config:     s3Cfg,
+		credStore:    credStore,
+		policyEngine: policyEngine,
+		logger:       logger,
 	}
 }
 
 // createUserS3Client creates an S3 client using user's delegated credentials
 func (h *S3Handler) createUserS3Client(ctx context.Context, cred *store.Credential) (*s3.Client, error) {
 	// Load AWS config with user's delegated credentials
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
+	loadOpts := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(h.s3Config.Region),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
 			cred.AccessKey,
 			cred.SecretKey,
 			cred.SessionToken,
 		)),
-	)
+	}
+
+	// Add custom endpoint resolver for non-AWS S3
+	if h.s3Config.Endpoint != "" && h.s3Config.Endpoint != "https://s3.amazonaws.com" {
+		loadOpts = append(loadOpts, awsconfig.WithEndpointResolver(aws.EndpointResolverFunc(func(service, region string) (aws.Endpoint, error) {
+			if service == "S3" {
+				return aws.Endpoint{
+					URL:           h.s3Config.Endpoint,
+					SigningRegion: h.s3Config.Region,
+				}, nil
+			}
+			return aws.Endpoint{}, &aws.EndpointNotFoundError{}
+		})))
+	}
+
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config with user credentials: %w", err)
 	}
 
-	// Create S3 client with optional endpoint override
+	// Create S3 client with path style
 	s3ClientOpts := func(o *s3.Options) {
-		if h.s3Config.Endpoint != "" && h.s3Config.Endpoint != "https://s3.amazonaws.com" {
-			o.BaseEndpoint = aws.String(h.s3Config.Endpoint)
-		}
-		// Use path style if configured
 		o.UsePathStyle = h.s3Config.ForcePathStyle
 	}
 
 	return s3.NewFromConfig(awsCfg, s3ClientOpts), nil
+}
+
+// getActionFromMethod converts HTTP method and path to S3 action
+func (h *S3Handler) getActionFromMethod(method, bucket, key string) string {
+	switch method {
+	case http.MethodGet:
+		if key == "" {
+			return "s3:ListBucket"
+		}
+		return "s3:GetObject"
+	case http.MethodPut:
+		return "s3:PutObject"
+	case http.MethodDelete:
+		if key == "" {
+			return "s3:DeleteBucket"
+		}
+		return "s3:DeleteObject"
+	case http.MethodHead:
+		return "s3:GetObject"
+	case http.MethodPost:
+		// POST can be used for various operations, default to ListBucket
+		return "s3:ListBucket"
+	default:
+		return "s3:GetObject"
+	}
 }
 
 // ProxyRequest proxies S3 requests after authorization
@@ -136,33 +175,54 @@ func (h *S3Handler) ProxyRequest(c *gin.Context) {
 		"bucket":     bucket,
 		"key":        key,
 		"duration":   time.Since(startTime).Milliseconds(),
-	}).Info("S3 request with delegated credentials - authorization enforced by backend")
+	}).Info("S3 request with policy enforcement - using admin credentials for backend")
 
-	// Create S3 client - use root client for local credentials (no backend), user client for real credentials
-	var s3Client *s3.Client
-	if cred.AccessKey != "" && cred.SecretKey != "" {
-		// Real AWS credentials (either permanent IAM keys or STS) - create user-specific client
-		userS3Client, err := h.createUserS3Client(c.Request.Context(), cred)
-		if err != nil {
-			h.logger.WithError(err).Error("Failed to create S3 client with user credentials")
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to initialize S3 client"})
-			return
-		}
-		s3Client = userS3Client
-
-		h.logger.WithFields(logrus.Fields{
-			"access_key": accessKey,
-			"cred_name":  cred.Name,
-		}).Debug("Using user's delegated credentials for S3 operation")
-	} else {
-		// Local credential (no backend) - use root S3 client with configured credentials
-		s3Client = h.s3Client.GetClient()
-
-		h.logger.WithFields(logrus.Fields{
-			"access_key": accessKey,
-			"cred_name":  cred.Name,
-		}).Debug("Using root S3 client for local credential")
+	// Evaluate policies for this request
+	action := h.getActionFromMethod(c.Request.Method, bucket, key)
+	resource := fmt.Sprintf("arn:aws:s3:::%s", bucket)
+	if key != "" {
+		resource = fmt.Sprintf("arn:aws:s3:::%s/%s", bucket, key)
 	}
+
+	policyCtx := &policy.EvaluationContext{
+		Action:   action,
+		Bucket:   bucket,
+		Key:      key,
+		Resource: resource,
+		UserID:   userInfo.Email,
+		Roles:    userInfo.Roles,
+	}
+
+	decision := h.policyEngine.Evaluate(policyCtx)
+	if !decision.Allowed {
+		h.logger.WithFields(logrus.Fields{
+			"user":     userInfo.Email,
+			"action":   action,
+			"resource": resource,
+			"reason":   decision.Reason,
+		}).Warn("Policy evaluation denied S3 operation")
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":  "Access denied",
+			"reason": decision.Reason,
+		})
+		return
+	}
+
+	h.logger.WithFields(logrus.Fields{
+		"user":     userInfo.Email,
+		"action":   action,
+		"resource": resource,
+		"allowed":  true,
+	}).Debug("Policy evaluation allowed S3 operation")
+
+	// Always use root S3 client with admin credentials for backend operations
+	// (SURF and other S3-compatible services may not support IAM user credentials)
+	s3Client := h.s3Client.GetClient()
+
+	h.logger.WithFields(logrus.Fields{
+		"access_key": accessKey,
+		"cred_name":  cred.Name,
+	}).Debug("Using root S3 client with admin credentials for backend operation")
 
 	// Proxy the request to S3
 	h.proxyToS3(c, s3Client, bucket, key, userInfo)

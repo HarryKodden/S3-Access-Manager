@@ -44,13 +44,7 @@ s3:
   # RECOMMENDED: Set via S3_REGION or AWS_REGION environment variable
   region: ""
 
-  # Backend type for admin provisioning:
-  #   "ceph"  - CEPH RadosGW (uses Admin API for sub-user provisioning)
-  #   "aws"   - AWS S3 (uses IAM API for access key provisioning)
-  #   "minio" - MinIO (uses Admin API for service account provisioning)
-  #   "local" - Local keys only (no backend provisioning, testing only)
-  # RECOMMENDED: Set via S3_BACKEND environment variable
-  backend: "local"
+  # Backend: Always uses AWS CLI for user/credential management
 
   # Optional: Custom S3-compatible storage (MinIO, Wasabi, etc.)
   # Set via S3_FORCE_PATH_STYLE environment variable
@@ -71,7 +65,6 @@ s3:
     # IAM region (defaults to S3 region if not specified)
     # Set via IAM_REGION environment variable
     region: ""
-
 
 policies:
   # Directory containing policy JSON files (synced to S3 backend)

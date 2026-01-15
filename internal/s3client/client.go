@@ -17,35 +17,46 @@ import (
 type Client struct {
 	s3Client  *s3.Client
 	awsConfig aws.Config
-	config    config.IAMConfig
+	config    config.S3Config
 	logger    *logrus.Logger
 }
 
 // NewClient creates a new S3 client
-func NewClient(cfg config.IAMConfig, logger *logrus.Logger) (*Client, error) {
+func NewClient(cfg config.S3Config, logger *logrus.Logger) (*Client, error) {
 	ctx := context.Background()
 
 	// Use IAM credentials for S3 operations
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
+	loadOpts := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(cfg.Region),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			cfg.AccessKey,
-			cfg.SecretKey,
+			cfg.IAM.AccessKey,
+			cfg.IAM.SecretKey,
 			"",
 		)),
-	)
+	}
+
+	// Add custom endpoint resolver for non-AWS S3
+	if cfg.Endpoint != "" && cfg.Endpoint != "https://s3.amazonaws.com" {
+		loadOpts = append(loadOpts, awsconfig.WithEndpointResolver(aws.EndpointResolverFunc(func(service, region string) (aws.Endpoint, error) {
+			if service == "S3" {
+				return aws.Endpoint{
+					URL:           cfg.Endpoint,
+					SigningRegion: cfg.Region,
+				}, nil
+			}
+			return aws.Endpoint{}, &aws.EndpointNotFoundError{}
+		})))
+	}
+
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	// Create S3 client with optional endpoint override
+	// Create S3 client with path style
 	s3ClientOpts := func(o *s3.Options) {
-		if cfg.Endpoint != "" && cfg.Endpoint != "https://s3.amazonaws.com" {
-			o.BaseEndpoint = aws.String(cfg.Endpoint)
-		}
-		// IAM clients typically don't use path style
-		o.UsePathStyle = false
+		o.UsePathStyle = cfg.ForcePathStyle
 	}
 
 	s3Client := s3.NewFromConfig(awsCfg, s3ClientOpts)
@@ -53,7 +64,7 @@ func NewClient(cfg config.IAMConfig, logger *logrus.Logger) (*Client, error) {
 	logger.WithFields(logrus.Fields{
 		"region":           cfg.Region,
 		"endpoint":         cfg.Endpoint,
-		"force_path_style": false, // IAM clients don't use path style
+		"force_path_style": cfg.ForcePathStyle,
 	}).Info("S3 client initialized with IAM credentials")
 
 	return &Client{

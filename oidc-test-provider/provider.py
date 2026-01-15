@@ -214,7 +214,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             <input type="hidden" name="code_challenge" value="{code_challenge}">
             <div class="form-group">
                 <label for="username">Username / Email</label>
-                <input type="text" id="username" name="username" value="test@example.com" required autofocus>
+                <input type="text" id="username" name="username" required autofocus>
             </div>
             <div class="form-group">
                 <label for="password">Password</label>
@@ -222,7 +222,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             </div>
             <div class="form-group">
                 <label for="roles">Roles (comma-separated)</label>
-                <input type="text" id="roles" name="roles" value="admin" placeholder="e.g., admin,user,developer">
+                <input type="text" id="roles" name="roles" placeholder="e.g., admin,user,developer">
             </div>
             <button type="submit">Sign In</button>
         </form>
@@ -346,6 +346,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             "userinfo_endpoint": f"{ISSUER}/userinfo",
             "jwks_uri": f"{ISSUER}/jwks",
             "response_types_supported": ["code", "token", "id_token"],
+            "grant_types_supported": ["authorization_code", "client_credentials"],
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["HS256"],
         }
@@ -391,14 +392,85 @@ class OIDCHandler(BaseHTTPRequestHandler):
             
             # Remove used code
             del AUTH_CODES[code]
+            
+            # Set user data for authorization code
+            user_email = code_data.get('username', '')
+            user_roles = code_data.get('roles', [''])
         
-        # Get user data from code data if available
-        user_email = "test@example.com"
-        user_roles = ["admin"]
+        elif grant_type == 'client_credentials':
+            # Handle client credentials flow
+            # Validate client credentials
+            auth_header = self.headers.get('Authorization', '')
+            
+            if not auth_header.startswith('Basic '):
+                # Check if client_id and client_secret are in form parameters
+                client_id = params.get('client_id', [''])[0]
+                client_secret = params.get('client_secret', [''])[0]
+                
+                if client_id != CLIENT_ID or client_secret != CLIENT_SECRET:
+                    self.send_response(401)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "invalid_client"}).encode())
+                    return
+            else:
+                # Decode Basic auth
+                import base64
+                try:
+                    credentials = base64.b64decode(auth_header[6:]).decode('utf-8')
+                    client_id, client_secret = credentials.split(':', 1)
+                    
+                    if client_id != CLIENT_ID or client_secret != CLIENT_SECRET:
+                        self.send_response(401)
+                        self.send_header('Content-Type', 'application/json')
+                        self.send_header('Access-Control-Allow-Origin', '*')
+                        self.end_headers()
+                        self.wfile.write(json.dumps({"error": "invalid_client"}).encode())
+                        return
+                except Exception:
+                    self.send_response(401)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "invalid_client"}).encode())
+                    return
+            
+            # Set user data for client credentials
+            user_email = CLIENT_ID
+            user_roles = [""]
+            custom_claims = {}
+            
+            # Parse all form parameters for custom claims
+            for param_name, param_values in params.items():
+                param_value = param_values[0] if param_values else ""
+                
+                if param_name == 'scope' and param_value:
+                    # Parse scope for roles (e.g., "roles:admin,user")
+                    scope_parts = param_value.split()
+                    for part in scope_parts:
+                        if part.startswith('roles:'):
+                            user_roles = part[6:].split(',')
+                            break
+                elif param_name in ['grant_type', 'client_id', 'client_secret']:
+                    # Skip OAuth standard parameters
+                    continue
+                elif param_value:
+                    # Add any other parameter as a custom claim
+                    custom_claims[param_name] = param_value
+            
+            # Set email from custom claims if provided, otherwise use client_id
+            if 'email' in custom_claims:
+                user_email = custom_claims['email']
+                del custom_claims['email']  # Remove from custom claims since it's handled separately
         
-        if grant_type == 'authorization_code':
-            user_email = code_data.get('username', 'test@example.com')
-            user_roles = code_data.get('roles', ['admin'])
+        else:
+            self.send_response(400)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "unsupported_grant_type"}).encode())
+            return
         
         # Generate JWT token
         payload = {
@@ -411,6 +483,9 @@ class OIDCHandler(BaseHTTPRequestHandler):
             ROLES_CLAIM: user_roles,
         }
         
+        # Add any custom claims
+        payload.update(custom_claims)
+        
         token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
         
         # Store token data for /userinfo endpoint
@@ -421,6 +496,9 @@ class OIDCHandler(BaseHTTPRequestHandler):
             'sub': user_email,
             'expires': datetime.now(timezone.utc) + timedelta(hours=1)
         }
+        
+        # Add custom claims to token data
+        TOKEN_DATA[token].update(custom_claims)
         
         response = {
             "access_token": token,
@@ -468,13 +546,18 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 "email": token_info['email'],
                 ROLES_CLAIM: token_info['roles'],
             }
+            
+            # Add any custom claims from token data
+            for key, value in token_info.items():
+                if key not in ['username', 'email', 'roles', 'sub', 'expires']:
+                    userinfo[key] = value
         else:
-            # Token not found, return default for backward compatibility
-            userinfo = {
-                "sub": "test@example.com",
-                "email": "test@example.com",
-                ROLES_CLAIM: ["admin"],
-            }
+            # Token not found, return unauthorized
+            self.send_response(401)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "token not valid"}).encode())
+            return
         
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
