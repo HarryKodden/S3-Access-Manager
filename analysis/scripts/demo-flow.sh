@@ -18,10 +18,11 @@ echo
 # Function to get access token using client_credentials
 get_token() {
     local scope=$1
+    local email=$2
     local token=$(curl -s -X POST "$OIDC_URL/token" \
         -H "Content-Type: application/x-www-form-urlencoded" \
         -u "$CLIENT_ID:$CLIENT_SECRET" \
-        -d "grant_type=client_credentials&scope=$scope&email=$ADMIN_EMAIL&roles=admin" | jq -r '.access_token')
+        -d "grant_type=client_credentials&scope=$scope&email=$email" | jq -r '.access_token')
 
     if [ "$token" = "null" ] || [ -z "$token" ]; then
         echo "❌ Failed to get access token for scope: $scope"
@@ -51,7 +52,7 @@ api_call() {
 
 echo "1️⃣ Authenticating as Admin User (role: admin)"
 echo "---------------------------------------------"
-ADMIN_TOKEN=$(get_token "roles:admin")
+ADMIN_TOKEN=$(get_token "roles:admin" "$ADMIN_EMAIL")
 echo "✅ Got admin access token"
 
 # Decode and display token info
@@ -78,7 +79,7 @@ echo
 
 echo "3️⃣ Authenticating as Normal User (role: user)"
 echo "---------------------------------------------"
-USER_TOKEN=$(get_token "roles:user")
+USER_TOKEN=$(get_token "roles:user" "user@example.com")
 echo "✅ Got user access token"
 
 # Decode and display token info

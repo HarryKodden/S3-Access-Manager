@@ -44,4 +44,3 @@ vendor/
 # Build
 dist/
 build/
-demo-flow-cli.sh
