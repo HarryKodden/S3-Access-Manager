@@ -98,13 +98,7 @@
                         </svg>
                         Roles
                     </button>
-                    <button class="tab" data-tab="buckets">
-                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
-                        </svg>
-                        Buckets
-                    </button>
-                    <button class="tab admin-only" data-tab="users" style="display: none;">
+                    <!-- <button class="tab admin-only" data-tab="users" style="display: none;">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
                             <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
                             <circle cx="9" cy="7" r="4"></circle>
@@ -112,7 +106,7 @@
                             <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
                         </svg>
                         Users
-                    </button>
+                    </button> -->
                 </nav>
 
                 <!-- Tab Contents -->
@@ -161,8 +155,8 @@
                     <!-- Roles Tab -->
                     <div id="roles-tab" class="tab-panel">
                         <div class="panel-header">
-                            <h3>Role Mappings</h3>
-                            <button class="btn-icon admin-only" onclick="showCreateRoleModal()" title="New Role" style="width: auto; padding: 0.5rem 0.75rem;">
+                            <h3>Roles</h3>
+                            <button class="btn-icon admin-only" onclick="showCreateGroupModal()" title="New Group" style="width: auto; padding: 0.5rem 0.75rem;">
                                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                     <line x1="12" y1="5" x2="12" y2="19"></line>
                                     <line x1="5" y1="12" x2="19" y2="12"></line>
@@ -174,57 +168,6 @@
                         </div>
                     </div>
 
-                    <!-- Buckets Tab -->
-                    <div id="buckets-tab" class="tab-panel">
-                        <div class="panel-header">
-                            <h3>Buckets</h3>
-                            <button id="create-bucket-btn" class="btn-icon" title="Create Bucket">
-                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                                    <line x1="12" y1="5" x2="12" y2="19"></line>
-                                    <line x1="5" y1="12" x2="19" y2="12"></line>
-                                </svg>
-                            </button>
-                        </div>
-                        
-                        <!-- Credential Selector -->
-                        <div class="credential-selector-container" style="margin-bottom: 1rem; padding: 1rem; background: var(--card-bg); border: 1px solid var(--border-color); border-radius: 8px;">
-                            <div style="display: flex; align-items: center; gap: 1rem;">
-                                <div style="flex: 1;">
-                                    <label for="bucket-credential-select" style="display: block; margin-bottom: 0.5rem; font-weight: 600; font-size: 0.875rem;">
-                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" style="vertical-align: middle; margin-right: 0.25rem;">
-                                            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
-                                            <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
-                                        </svg>
-                                        Select Credential for S3 Operations
-                                    </label>
-                                    <select id="bucket-credential-select" style="width: 100%; padding: 0.5rem; border: 1px solid var(--border-color); border-radius: 4px; background: var(--bg-color); color: var(--text-color); font-size: 0.875rem;">
-                                        <option value="">-- Select a credential --</option>
-                                    </select>
-                                    <small style="display: block; margin-top: 0.25rem; color: var(--text-secondary);">
-                                        All bucket and object operations will use the selected credential
-                                    </small>
-                                </div>
-                                <div id="selected-credential-info" style="display: none; padding: 0.75rem; background: var(--bg-color); border: 1px solid var(--success-color); border-radius: 4px; min-width: 200px;">
-                                    <div style="font-size: 0.75rem; color: var(--success-color); font-weight: 600; margin-bottom: 0.25rem;">
-                                        ✓ ACTIVE CREDENTIAL
-                                    </div>
-                                    <div id="selected-credential-name" style="font-weight: 600; font-size: 0.875rem;"></div>
-                                </div>
-                            </div>
-                        </div>
-                        
-                        <div id="buckets-list" class="credentials-list">
-                            <!-- Buckets will be displayed here -->
-                        </div>
-                    </div>
-
-                    <!-- Users Tab (Admin Only) -->
-                    <div id="users-tab" class="tab-panel admin-only" style="display: none;">
-                        <div class="panel-header">
-                            <h3>User Management</h3>
-                        </div>
-                        <div id="users-list" class="credentials-list">
-                            <!-- Users will be loaded here -->
                         </div>
                     </div>
                 </div>
@@ -247,7 +190,7 @@
                 <div class="form-group">
                     <label for="cred-roles">Select Roles (one or more)</label>
                     <div id="cred-roles" style="max-height: 200px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 4px; padding: 0.5rem;">
-                        <!-- Role checkboxes will be populated here -->
+                        <!-- Role checkboxes will be added here -->
                     </div>
                     <small>Select one or more roles to assign to this credential</small>
                 </div>
@@ -294,7 +237,7 @@
                 <div class="form-group">
                     <label>Assigned Roles</label>
                     <div id="inspect-cred-policies" style="display: flex; flex-wrap: wrap; gap: 0.5rem;">
-                        <!-- Role badges will be shown here -->
+                        <!-- Group badges will be shown here -->
                     </div>
                 </div>
                 <div class="form-group">
@@ -314,71 +257,6 @@
 
     <!-- Notification Toast -->
     <div id="toast" class="toast"></div>
-
-    <!-- Create Bucket Modal -->
-    <div id="create-bucket-modal" class="modal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h3>Create Bucket</h3>
-                <button class="modal-close">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div class="form-group">
-                    <label for="new-bucket-name">Bucket Name</label>
-                    <input type="text" id="new-bucket-name" placeholder="e.g., my-data-bucket" />
-                    <small>Bucket names must be unique and follow S3 naming rules</small>
-                </div>
-            </div>
-            <div class="modal-footer">
-                <button class="btn btn-secondary modal-cancel">Cancel</button>
-                <button id="confirm-create-bucket" class="btn btn-primary">Create Bucket</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- Inspect Bucket Modal -->
-    <div id="inspect-bucket-modal" class="modal">
-        <div class="modal-content" style="max-width: 900px;">
-            <div class="modal-header">
-                <h3 id="inspect-bucket-title">Bucket Contents</h3>
-                <button class="modal-close">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div class="breadcrumb" id="bucket-breadcrumb" style="margin-bottom: 1rem;"></div>
-                <div id="bucket-objects-list" class="objects-list" style="max-height: 500px; overflow-y: auto;">
-                    <!-- Objects will be loaded here -->
-                </div>
-            </div>
-            <div class="modal-footer">
-                <button class="btn btn-secondary modal-close">Close</button>
-            </div>
-        </div>
-    </div>
-
-    <!-- Upload File Modal -->
-    <div id="upload-modal" class="modal">
-        <div class="modal-content">
-            <div class="modal-header">
-                <h3>Upload File to <span id="upload-bucket-name" style="color: var(--primary-color);"></span></h3>
-                <button class="modal-close">&times;</button>
-            </div>
-            <div class="modal-body">
-                <div class="form-group">
-                    <label for="upload-file-input">Select File</label>
-                    <input type="file" id="upload-file-input" />
-                </div>
-                <div class="form-group">
-                    <label for="upload-key-prefix">Path (optional)</label>
-                    <input type="text" id="upload-key-prefix" placeholder="e.g., folder/subfolder" />
-                    <small>Leave empty to upload to bucket root</small>
-                </div>
-            </div>
-            <div class="modal-footer">
-                <button class="btn btn-secondary modal-cancel">Cancel</button>
-                <button id="confirm-upload" class="btn btn-primary" onclick="handleFileUpload()">Upload</button>
-            </div>
-        </div>
-    </div>
 
     <!-- Create/Edit Policy Modal -->
     <div id="policy-modal" class="modal">
@@ -419,34 +297,46 @@
         </div>
     </div>
 
-    <!-- Create/Edit Role Modal -->
-    <div id="role-modal" class="modal">
+    <!-- Create/Edit Group Modal -->
+    <div id="group-modal" class="modal">
         <div class="modal-content" style="max-width: 700px;">
             <div class="modal-header">
-                <h3 id="role-modal-title">Create New Role</h3>
+                <h3 id="group-modal-title">Create New Role</h3>
                 <button class="modal-close">&times;</button>
             </div>
             <div class="modal-body">
                 <div class="form-group">
-                    <label for="role-name">Role Name</label>
-                    <input type="text" id="role-name" placeholder="admin" />
-                    <small>Must match OIDC role claim value (e.g., "admin", "developer", "viewer")</small>
+                    <label for="group-name-select">SCIM Group Name</label>
+                    <input type="text" id="group-name" placeholder="admin" style="display: none;" />
+                    <select id="group-name-select" style="width: 100%; padding: 0.5rem; border: 1px solid var(--border-color); border-radius: 4px; background: var(--bg-color); color: var(--text-color);">
+                        <option value="">-- Select a SCIM group --</option>
+                    </select>
+                    <small>Roles are mapped to SCIM groups. SCIM groups must be provisioned first.</small>
                 </div>
                 <div class="form-group">
-                    <label for="role-description">Description (optional)</label>
-                    <input type="text" id="role-description" placeholder="Administrator with full access" />
+                    <label for="group-description">Description (optional)</label>
+                    <input type="text" id="group-description" placeholder="Administrator with full access" />
                 </div>
                 <div class="form-group">
                     <label>Assigned Policies</label>
-                    <div id="role-policies-selector" class="policies-selector" style="border: 1px solid var(--border-color); border-radius: 4px; padding: 0.75rem; max-height: 300px; overflow-y: auto;">
+                    <div id="group-policies-selector" class="policies-selector" style="border: 1px solid var(--border-color); border-radius: 4px; padding: 0.75rem; max-height: 300px; overflow-y: auto;">
                         <!-- Policy checkboxes will be loaded here -->
                     </div>
-                    <small>Select one or more policies to assign to this role</small>
+                    <small>Select one or more policies to assign to this group. At least one policy is required.</small>
                 </div>
             </div>
             <div class="modal-footer">
                 <button class="btn btn-secondary modal-cancel">Cancel</button>
-                <button class="btn btn-primary" id="confirm-save-role">Save Role</button>
+                <button class="btn btn-primary" id="confirm-save-group">Save Group</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Generic Modal for Dynamic Content -->
+    <div id="generic-modal" class="modal">
+        <div class="modal-content" style="max-width: 800px;">
+            <div id="generic-modal-content">
+                <!-- Dynamic content will be inserted here -->
             </div>
         </div>
     </div>

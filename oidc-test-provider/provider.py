@@ -29,7 +29,7 @@ JWT_SECRET = "test-jwt-secret-key-do-not-use-in-production"
 ISSUER = os.getenv('ISSUER', f"http://localhost:{PORT}")
 CLIENT_ID = os.getenv('CLIENT_ID', "test-client")
 CLIENT_SECRET = os.getenv('CLIENT_SECRET', "test-secret")
-ROLES_CLAIM = os.getenv('ROLES_CLAIM', 'Roles')
+ROLES_CLAIM = os.getenv('ROLES_CLAIM', 'eduPersonEntitlement')  # OIDC standard claim for group memberships
 
 # Store authorization codes temporarily (in production, use Redis or similar)
 AUTH_CODES = {}
@@ -75,6 +75,8 @@ class OIDCHandler(BaseHTTPRequestHandler):
             self.send_userinfo()
         elif parsed_path.path == '/jwks':
             self.send_jwks()
+        elif parsed_path.path.startswith('/test-token/'):
+            self.send_test_token(parsed_path.path)
         else:
             logger.warning(f"404 Not Found: {parsed_path.path} from {client_ip}")
             self.send_response(404)
@@ -238,8 +240,8 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 <input type="password" id="password" name="password" placeholder="(any value accepted)">
             </div>
             <div class="form-group">
-                <label for="roles">Roles (comma-separated)</label>
-                <input type="text" id="roles" name="roles" placeholder="e.g., admin,user,developer">
+                <label for="roles">Groups (comma-separated SCIM group IDs)</label>
+                <input type="text" id="roles" name="roles" placeholder="e.g., admin-group,developer-group">
             </div>
             <button type="submit">Sign In</button>
         </form>
@@ -421,6 +423,35 @@ class OIDCHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({"error": "expired_token"}).encode())
                 return
 
+            # Validate PKCE code_verifier
+            code_verifier = params.get('code_verifier', [''])[0]
+            stored_challenge = code_data.get('code_challenge', '')
+
+            if stored_challenge and code_verifier:
+                # Compute expected challenge from verifier
+                import hashlib
+                import base64
+                expected_challenge = base64.urlsafe_b64encode(
+                    hashlib.sha256(code_verifier.encode()).digest()
+                ).decode().rstrip('=')
+
+                if expected_challenge != stored_challenge:
+                    logger.error(f"PKCE validation failed from {client_ip}: expected {expected_challenge}, got {stored_challenge}")
+                    self.send_response(400)
+                    self.send_header('Content-Type', 'application/json')
+                    self.send_header('Access-Control-Allow-Origin', '*')
+                    self.end_headers()
+                    self.wfile.write(json.dumps({"error": "invalid_grant"}).encode())
+                    return
+            elif stored_challenge:
+                logger.error(f"PKCE validation failed from {client_ip}: missing code_verifier")
+                self.send_response(400)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self.wfile.write(json.dumps({"error": "invalid_grant"}).encode())
+                return
+
             # Remove used code
             del AUTH_CODES[code]
 
@@ -517,7 +548,6 @@ class OIDCHandler(BaseHTTPRequestHandler):
         payload = {
             "iss": ISSUER,
             "sub": user_email,
-            "aud": CLIENT_ID,
             "exp": int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp()),
             "iat": int(datetime.now(timezone.utc).timestamp()),
             "email": user_email,
@@ -574,40 +604,47 @@ class OIDCHandler(BaseHTTPRequestHandler):
         # Extract token
         token = auth_header[7:]  # Remove 'Bearer ' prefix
 
-        # Look up token data
-        if token in TOKEN_DATA:
-            token_info = TOKEN_DATA[token]
-
+        # Decode and validate JWT token
+        try:
+            payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+            
             # Check if token is expired
-            if datetime.now(timezone.utc) > token_info['expires']:
-                del TOKEN_DATA[token]
-                logger.warning(f"Expired token used from {client_ip} - token: {token[:20]}...")
+            exp = payload.get('exp', 0)
+            if datetime.now(timezone.utc).timestamp() > exp:
+                logger.warning(f"Expired token used from {client_ip}")
                 self.send_response(401)
                 self.send_header('Content-Type', 'application/json')
                 self.end_headers()
                 self.wfile.write(json.dumps({"error": "token_expired"}).encode())
                 return
 
-            user_email = token_info.get('email', '')
+            user_email = payload.get('email', '')
             logger.info(f"Userinfo request from {client_ip} for user: {user_email}")
 
             userinfo = {
-                "sub": token_info['sub'],
-                "email": token_info['email'],
-                ROLES_CLAIM: token_info['roles'],
+                "sub": payload.get('sub', ''),
+                "email": payload.get('email', ''),
+                ROLES_CLAIM: payload.get(ROLES_CLAIM, []),
             }
 
-            # Add any custom claims from token data
-            for key, value in token_info.items():
-                if key not in ['username', 'email', 'roles', 'sub', 'expires']:
+            # Add any custom claims from the token
+            for key, value in payload.items():
+                if key not in ['iss', 'sub', 'aud', 'exp', 'iat', 'email', ROLES_CLAIM]:
                     userinfo[key] = value
-        else:
-            # Token not found, return unauthorized
-            logger.error(f"Invalid token used from {client_ip} - token: {token[:20]}...")
+
+        except jwt.ExpiredSignatureError:
+            logger.warning(f"Expired JWT token used from {client_ip}")
             self.send_response(401)
             self.send_header('Content-Type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps({"error": "token not valid"}).encode())
+            self.wfile.write(json.dumps({"error": "token_expired"}).encode())
+            return
+        except jwt.InvalidTokenError as e:
+            logger.error(f"Invalid JWT token used from {client_ip}: {str(e)}")
+            self.send_response(401)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "invalid_token"}).encode())
             return
 
         self.send_response(200)
@@ -630,6 +667,56 @@ class OIDCHandler(BaseHTTPRequestHandler):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.end_headers()
         self.wfile.write(json.dumps(jwks).encode())
+
+    def send_test_token(self, path):
+        """Generate a test token for a specific user (for testing purposes)"""
+        client_ip = self.client_address[0] if self.client_address else 'unknown'
+        
+        # Extract username from path: /test-token/{username}
+        parts = path.split('/')
+        if len(parts) < 3:
+            logger.error(f"Invalid test token path from {client_ip}: {path}")
+            self.send_response(400)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "invalid_path"}).encode())
+            return
+        
+        username = parts[2]
+        logger.info(f"Test token requested for user '{username}' from {client_ip}")
+        
+        # Generate token with admin roles for testing
+        now = datetime.now(timezone.utc)
+        payload = {
+            "iss": ISSUER,
+            "sub": username,
+            "email": username,
+            "exp": int((now + timedelta(hours=1)).timestamp()),
+            "iat": int(now.timestamp()),
+            "eduPersonEntitlement": ["developer-group"]  # OIDC standard claim; use SCIM group IDs
+        }
+        
+        token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+        
+        # Store token data for /userinfo endpoint
+        TOKEN_DATA[token] = {
+            'username': username,
+            'roles': ["admin", "user", "developer"],
+            'expires': now + timedelta(hours=1)
+        }
+        
+        response = {
+            "access_token": token,
+            "token_type": "Bearer",
+            "expires_in": 3600
+        }
+        
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(json.dumps(response).encode())
 
 def cleanup_expired_tokens():
     """Clean up expired authorization codes and tokens"""

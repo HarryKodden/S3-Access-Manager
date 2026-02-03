@@ -50,6 +50,41 @@ type UserManager interface {
 	// ListUsers lists all users in the backend
 	ListUsers(ctx context.Context) ([]string, error)
 
+	// GetUserDetails returns detailed information about a specific user
+	GetUserDetails(ctx context.Context, username string) (UserDetails, error)
+
 	// DeleteUser deletes a user and all associated resources (access keys, policies, etc.)
 	DeleteUser(ctx context.Context, username string) error
+}
+
+// UserDetails contains comprehensive information about a user
+type UserDetails struct {
+	Username    string           `json:"username"`
+	CreateDate  string           `json:"create_date,omitempty"`
+	Groups      []string         `json:"groups"`
+	Policies    []UserPolicy     `json:"policies"`
+	AccessKeys  []AccessKeyInfo  `json:"access_keys"`
+	ScimDetails *ScimUserDetails `json:"scim_details,omitempty"`
+}
+
+// UserPolicy represents a policy attached to a user
+type UserPolicy struct {
+	Name     string `json:"name"`
+	Type     string `json:"type"` // "Managed" or "Inline"
+	Document string `json:"document,omitempty"`
+}
+
+// AccessKeyInfo represents access key information
+type AccessKeyInfo struct {
+	AccessKeyId string `json:"access_key_id"`
+	Status      string `json:"status"`
+	CreateDate  string `json:"create_date"`
+}
+
+// ScimUserDetails contains SCIM-specific user information
+type ScimUserDetails struct {
+	ID          string   `json:"id"`
+	DisplayName string   `json:"display_name"`
+	Email       string   `json:"email"`
+	Groups      []string `json:"groups"`
 }

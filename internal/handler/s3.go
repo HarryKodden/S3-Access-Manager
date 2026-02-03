@@ -28,30 +28,35 @@ type S3Handler struct {
 	s3Client     *s3client.Client // Root client for admin operations only
 	s3Config     config.S3Config  // S3 configuration for endpoint/region
 	credStore    *store.CredentialStore
+	groupStore   *store.GroupStore
+	userStore    *store.UserStore
 	policyEngine *policy.Engine
 	logger       *logrus.Logger
 }
 
 // NewS3Handler creates a new S3 handler
-func NewS3Handler(client *s3client.Client, s3Cfg config.S3Config, credStore *store.CredentialStore, policyEngine *policy.Engine, logger *logrus.Logger) *S3Handler {
+func NewS3Handler(client *s3client.Client, s3Cfg config.S3Config, credStore *store.CredentialStore, groupStore *store.GroupStore, userStore *store.UserStore, policyEngine *policy.Engine, logger *logrus.Logger) *S3Handler {
 	return &S3Handler{
 		s3Client:     client,
 		s3Config:     s3Cfg,
 		credStore:    credStore,
+		groupStore:   groupStore,
+		userStore:    userStore,
 		policyEngine: policyEngine,
 		logger:       logger,
 	}
 }
 
-// createUserS3Client creates an S3 client using user's delegated credentials
-func (h *S3Handler) createUserS3Client(ctx context.Context, cred *store.Credential) (*s3.Client, error) {
-	// Load AWS config with user's delegated credentials
+// CreateUserS3Client creates an S3 client using user's delegated credentials
+func (h *S3Handler) CreateUserS3Client(ctx context.Context, cred *store.Credential) (*s3.Client, error) {
+	// For S3 operations, use admin credentials since user access keys may not be valid on remote backends
+	// The policy enforcement happens at the gateway level, not at the S3 backend level
 	loadOpts := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(h.s3Config.Region),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			cred.AccessKey,
-			cred.SecretKey,
-			cred.SessionToken,
+			h.s3Config.IAM.AccessKey, // Use admin access key for S3 operations
+			h.s3Config.IAM.SecretKey, // Use admin secret key for S3 operations
+			"",
 		)),
 	}
 
@@ -110,42 +115,88 @@ func (h *S3Handler) getActionFromMethod(method, bucket, key string) string {
 func (h *S3Handler) ProxyRequest(c *gin.Context) {
 	startTime := time.Now()
 
-	// Extract user info from context (set by OIDC auth middleware)
+	// Extract user info from context (set by auth middleware)
 	userInfoValue, exists := c.Get("userInfo")
 	if !exists {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		c.Header("Content-Type", "application/xml")
+		c.XML(http.StatusUnauthorized, gin.H{
+			"Error": gin.H{
+				"Code":    "AccessDenied",
+				"Message": "Unauthorized",
+			},
+		})
 		return
 	}
 	userInfo := userInfoValue.(*auth.UserInfo)
 
-	// Get selected credential from header
-	accessKey := c.GetHeader("X-S3-Credential-AccessKey")
-	if accessKey == "" {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": "Missing X-S3-Credential-AccessKey header",
-			"hint":  "Select a credential in the UI before performing S3 operations",
-		})
-		return
-	}
+	// Get selected credential - check context first (for access key auth), then header (for OIDC auth)
+	var cred *store.Credential
+	var accessKey string
 
-	// Get credential from store
-	cred, err := h.credStore.Get(accessKey)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Credential not found"})
-		return
-	}
-
-	// Validate credential belongs to authenticated user
-	if cred.UserID != userInfo.Email {
+	// Check if credential was set by access key authentication
+	selectedCredValue, hasSelectedCred := c.Get("selectedCredential")
+	if hasSelectedCred {
+		cred = selectedCredValue.(*store.Credential)
+		accessKey = cred.AccessKey
 		h.logger.WithFields(logrus.Fields{
-			"user_email":   userInfo.Email,
-			"cred_user_id": cred.UserID,
-			"access_key":   accessKey,
-			"user_subject": userInfo.Subject,
-			"user_roles":   userInfo.Roles,
-		}).Warn("User attempted to use credential belonging to another user")
-		c.JSON(http.StatusForbidden, gin.H{"error": "Credential does not belong to you"})
-		return
+			"user":        userInfo.Subject,
+			"email":       userInfo.Email,
+			"access_key":  accessKey,
+			"auth_method": "access_key",
+		}).Debug("Using credential from access key authentication")
+	} else {
+		// Fall back to header-based credential selection (OIDC auth)
+		accessKey = c.GetHeader("X-S3-Credential-AccessKey")
+		if accessKey == "" {
+			c.Header("Content-Type", "application/xml")
+			c.XML(http.StatusBadRequest, gin.H{
+				"Error": gin.H{
+					"Code":    "InvalidRequest",
+					"Message": "Missing X-S3-Credential-AccessKey header",
+				},
+			})
+			return
+		}
+
+		// Get credential from store
+		var err error
+		cred, err = h.credStore.Get(accessKey)
+		if err != nil {
+			c.Header("Content-Type", "application/xml")
+			c.XML(http.StatusNotFound, gin.H{
+				"Error": gin.H{
+					"Code":    "InvalidAccessKeyId",
+					"Message": "Credential not found",
+				},
+			})
+			return
+		}
+
+		// Validate credential belongs to authenticated user
+		if cred.UserID != userInfo.Email {
+			h.logger.WithFields(logrus.Fields{
+				"user_email":   userInfo.Email,
+				"cred_user_id": cred.UserID,
+				"access_key":   accessKey,
+				"user_subject": userInfo.Subject,
+				"user_groups":  userInfo.Groups,
+			}).Warn("User attempted to use credential belonging to another user")
+			c.Header("Content-Type", "application/xml")
+			c.XML(http.StatusForbidden, gin.H{
+				"Error": gin.H{
+					"Code":    "AccessDenied",
+					"Message": "Credential does not belong to you",
+				},
+			})
+			return
+		}
+
+		h.logger.WithFields(logrus.Fields{
+			"user":        userInfo.Subject,
+			"email":       userInfo.Email,
+			"access_key":  accessKey,
+			"auth_method": "oidc",
+		}).Debug("Using credential from header selection")
 	}
 
 	// Parse S3 path: /{bucket}/{key...}
@@ -154,7 +205,13 @@ func (h *S3Handler) ProxyRequest(c *gin.Context) {
 
 	parts := strings.SplitN(proxyPath, "/", 2)
 	if len(parts) == 0 || parts[0] == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid S3 path"})
+		c.Header("Content-Type", "application/xml")
+		c.XML(http.StatusBadRequest, gin.H{
+			"Error": gin.H{
+				"Code":    "InvalidBucketName",
+				"Message": "Invalid S3 path",
+			},
+		})
 		return
 	}
 
@@ -170,7 +227,7 @@ func (h *S3Handler) ProxyRequest(c *gin.Context) {
 		"email":      userInfo.Email,
 		"access_key": accessKey,
 		"cred_name":  cred.Name,
-		"roles":      userInfo.Roles,
+		"groups":     userInfo.Groups,
 		"method":     c.Request.Method,
 		"bucket":     bucket,
 		"key":        key,
@@ -184,13 +241,30 @@ func (h *S3Handler) ProxyRequest(c *gin.Context) {
 		resource = fmt.Sprintf("arn:aws:s3:::%s/%s", bucket, key)
 	}
 
+	// Resolve user's groups to applicable policies
+	applicablePolicies := make([]string, 0)
+	for _, groupName := range userInfo.Groups {
+		// Group name is now the SCIM group ID
+		scimGroupId := groupName
+
+		if scimGroupId != "" {
+			group, err := h.groupStore.Get(scimGroupId)
+			if err != nil {
+				h.logger.WithError(err).WithField("group", groupName).Warn("Failed to get group definition")
+				continue
+			}
+			applicablePolicies = append(applicablePolicies, group.Policies...)
+		}
+	}
+
 	policyCtx := &policy.EvaluationContext{
 		Action:   action,
 		Bucket:   bucket,
 		Key:      key,
 		Resource: resource,
 		UserID:   userInfo.Email,
-		Roles:    userInfo.Roles,
+		Groups:   userInfo.Groups,
+		Policies: applicablePolicies,
 	}
 
 	decision := h.policyEngine.Evaluate(policyCtx)
@@ -201,9 +275,12 @@ func (h *S3Handler) ProxyRequest(c *gin.Context) {
 			"resource": resource,
 			"reason":   decision.Reason,
 		}).Warn("Policy evaluation denied S3 operation")
-		c.JSON(http.StatusForbidden, gin.H{
-			"error":  "Access denied",
-			"reason": decision.Reason,
+		c.Header("Content-Type", "application/xml")
+		c.XML(http.StatusForbidden, gin.H{
+			"Error": gin.H{
+				"Code":    "AccessDenied",
+				"Message": fmt.Sprintf("Access denied: %s", decision.Reason),
+			},
 		})
 		return
 	}
@@ -215,41 +292,159 @@ func (h *S3Handler) ProxyRequest(c *gin.Context) {
 		"allowed":  true,
 	}).Debug("Policy evaluation allowed S3 operation")
 
-	// Always use root S3 client with admin credentials for backend operations
-	// (SURF and other S3-compatible services may not support IAM user credentials)
-	s3Client := h.s3Client.GetClient()
+	// Create S3 client using user's delegated credentials
+	s3Client, err := h.CreateUserS3Client(c.Request.Context(), cred)
+	if err != nil {
+		h.logger.WithError(err).WithFields(logrus.Fields{
+			"user":       userInfo.Email,
+			"access_key": accessKey,
+			"cred_name":  cred.Name,
+		}).Error("Failed to create S3 client with user credentials")
+		c.Header("Content-Type", "application/xml")
+		c.XML(http.StatusInternalServerError, gin.H{
+			"Error": gin.H{
+				"Code":    "InternalError",
+				"Message": "Failed to initialize S3 client",
+			},
+		})
+		return
+	}
 
 	h.logger.WithFields(logrus.Fields{
 		"access_key": accessKey,
 		"cred_name":  cred.Name,
-	}).Debug("Using root S3 client with admin credentials for backend operation")
+	}).Debug("Using S3 client with user credentials for backend operation")
 
 	// Proxy the request to S3
-	h.proxyToS3(c, s3Client, bucket, key, userInfo)
+	h.ProxyToS3(c, s3Client, bucket, key, userInfo)
 }
 
-// proxyToS3 forwards the request to S3 using the provided client
-func (h *S3Handler) proxyToS3(c *gin.Context, s3Client *s3.Client, bucket, key string, userInfo *auth.UserInfo) {
+// ListBuckets handles S3 list buckets operation for AWS CLI compatibility
+func (h *S3Handler) ListBuckets(c *gin.Context) {
+	// Extract user info from context (set by auth middleware)
+	userInfoValue, exists := c.Get("userInfo")
+	if !exists {
+		c.Header("Content-Type", "application/xml")
+		c.XML(http.StatusUnauthorized, gin.H{
+			"Error": gin.H{
+				"Code":    "AccessDenied",
+				"Message": "Unauthorized",
+			},
+		})
+		return
+	}
+	userInfo := userInfoValue.(*auth.UserInfo)
+
+	// Check if credential was set by access key authentication
+	_, hasSelectedCred := c.Get("selectedCredential")
+	if hasSelectedCred {
+		// Credential is available, proceed
+	} else {
+		// This shouldn't happen for CLI requests, but handle it just in case
+		c.Header("Content-Type", "application/xml")
+		c.XML(http.StatusBadRequest, gin.H{
+			"Error": gin.H{
+				"Code":    "InvalidRequest",
+				"Message": "No credential available for list buckets",
+			},
+		})
+		return
+	}
+
+	// Get all buckets from the S3 backend
+	ctx := c.Request.Context()
+	result, err := h.s3Client.GetClient().ListBuckets(ctx, &s3.ListBucketsInput{})
+	if err != nil {
+		h.logger.WithError(err).Error("Failed to list buckets from S3 backend")
+		c.Header("Content-Type", "application/xml")
+		c.XML(http.StatusInternalServerError, gin.H{
+			"Error": gin.H{
+				"Code":    "InternalError",
+				"Message": "Failed to list buckets",
+			},
+		})
+		return
+	}
+
+	// Filter buckets based on user policies
+	// For list buckets, we check if the user has any access to each bucket
+	allowedBuckets := make([]gin.H, 0)
+
+	// Resolve user's groups to applicable policies
+	applicablePolicies := make([]string, 0)
+	for _, groupName := range userInfo.Groups {
+		scimGroupId := groupName
+		if scimGroupId != "" {
+			group, err := h.groupStore.Get(scimGroupId)
+			if err != nil {
+				h.logger.WithError(err).WithField("group", groupName).Warn("Failed to get group definition")
+				continue
+			}
+			applicablePolicies = append(applicablePolicies, group.Policies...)
+		}
+	}
+
+	for _, bucket := range result.Buckets {
+		bucketName := *bucket.Name
+
+		// Check if user has any access to this bucket
+		// We check for s3:ListBucket permission on the bucket
+		resource := fmt.Sprintf("arn:aws:s3:::%s", bucketName)
+		policyCtx := &policy.EvaluationContext{
+			Action:   "s3:ListBucket",
+			Bucket:   bucketName,
+			Resource: resource,
+			UserID:   userInfo.Email,
+			Groups:   userInfo.Groups,
+			Policies: applicablePolicies,
+		}
+
+		decision := h.policyEngine.Evaluate(policyCtx)
+		if decision.Allowed {
+			allowedBuckets = append(allowedBuckets, gin.H{
+				"Name":         bucketName,
+				"CreationDate": bucket.CreationDate.Format(time.RFC3339),
+			})
+		}
+	}
+
+	// Return S3-compatible XML response
+	xmlResponse := gin.H{
+		"Buckets": gin.H{
+			"Bucket": allowedBuckets,
+		},
+		"Owner": gin.H{
+			"ID":          userInfo.Subject,
+			"DisplayName": userInfo.Email,
+		},
+	}
+
+	c.Header("Content-Type", "application/xml")
+	c.XML(http.StatusOK, gin.H{"ListAllMyBucketsResponse": xmlResponse})
+}
+
+// ProxyToS3 forwards the request to S3 using the provided client
+func (h *S3Handler) ProxyToS3(c *gin.Context, s3Client *s3.Client, bucket, key string, userInfo *auth.UserInfo) {
 	method := c.Request.Method
 
 	switch method {
 	case http.MethodGet:
-		h.handleGet(c, s3Client, bucket, key)
+		h.handleGet(c, s3Client, bucket, key, userInfo)
 	case http.MethodPut:
-		h.handlePut(c, s3Client, bucket, key)
+		h.handlePut(c, s3Client, bucket, key, userInfo)
 	case http.MethodDelete:
-		h.handleDelete(c, s3Client, bucket, key)
+		h.handleDelete(c, s3Client, bucket, key, userInfo)
 	case http.MethodHead:
-		h.handleHead(c, s3Client, bucket, key)
+		h.handleHead(c, s3Client, bucket, key, userInfo)
 	case http.MethodPost:
-		h.handlePost(c, s3Client, bucket, key)
+		h.handlePost(c, s3Client, bucket, key, userInfo)
 	default:
 		c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "Method not allowed"})
 	}
 }
 
 // handleGet handles GET requests (download)
-func (h *S3Handler) handleGet(c *gin.Context, s3Client *s3.Client, bucket, key string) {
+func (h *S3Handler) handleGet(c *gin.Context, s3Client *s3.Client, bucket, key string, userInfo *auth.UserInfo) {
 	if key == "" {
 		// List objects in bucket
 		h.handleListObjects(c, s3Client, bucket)
@@ -265,7 +460,13 @@ func (h *S3Handler) handleGet(c *gin.Context, s3Client *s3.Client, bucket, key s
 
 	if err != nil {
 		h.logger.WithError(err).Error("Failed to get object from S3")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get object"})
+		c.Header("Content-Type", "application/xml")
+		c.XML(http.StatusInternalServerError, gin.H{
+			"Error": gin.H{
+				"Code":    "NoSuchKey",
+				"Message": "Failed to get object",
+			},
+		})
 		return
 	}
 	defer func() {
@@ -296,9 +497,35 @@ func (h *S3Handler) handleGet(c *gin.Context, s3Client *s3.Client, bucket, key s
 }
 
 // handlePut handles PUT requests (upload)
-func (h *S3Handler) handlePut(c *gin.Context, s3Client *s3.Client, bucket, key string) {
+func (h *S3Handler) handlePut(c *gin.Context, s3Client *s3.Client, bucket, key string, userInfo *auth.UserInfo) {
 	if key == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Key is required for PUT"})
+		// This is a bucket creation request
+		ctx := c.Request.Context()
+		_, err := s3Client.CreateBucket(ctx, &s3.CreateBucketInput{
+			Bucket: aws.String(bucket),
+		})
+
+		if err != nil {
+			h.logger.WithError(err).WithFields(logrus.Fields{
+				"bucket": bucket,
+				"user":   userInfo.Email,
+			}).Error("Failed to create bucket in S3")
+			c.Header("Content-Type", "application/xml")
+			c.XML(http.StatusInternalServerError, gin.H{
+				"Error": gin.H{
+					"Code":    "InternalError",
+					"Message": "Failed to create bucket",
+				},
+			})
+			return
+		}
+
+		h.logger.WithFields(logrus.Fields{
+			"bucket": bucket,
+			"user":   userInfo.Email,
+		}).Info("Bucket created successfully")
+
+		c.Status(http.StatusOK)
 		return
 	}
 
@@ -306,7 +533,13 @@ func (h *S3Handler) handlePut(c *gin.Context, s3Client *s3.Client, bucket, key s
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		h.logger.WithError(err).Error("Failed to read request body")
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to read request body"})
+		c.Header("Content-Type", "application/xml")
+		c.XML(http.StatusBadRequest, gin.H{
+			"Error": gin.H{
+				"Code":    "InvalidRequest",
+				"Message": "Failed to read request body",
+			},
+		})
 		return
 	}
 
@@ -320,18 +553,35 @@ func (h *S3Handler) handlePut(c *gin.Context, s3Client *s3.Client, bucket, key s
 	})
 
 	if err != nil {
-		h.logger.WithError(err).Error("Failed to put object to S3")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to upload object"})
+		h.logger.WithError(err).WithFields(logrus.Fields{
+			"bucket": bucket,
+			"key":    key,
+			"user":   userInfo.Email,
+		}).Error("Failed to put object to S3")
+		c.Header("Content-Type", "application/xml")
+		c.XML(http.StatusInternalServerError, gin.H{
+			"Error": gin.H{
+				"Code":    "InternalError",
+				"Message": "Failed to upload object",
+			},
+		})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "uploaded"})
+	// S3 PUT operations return 200 OK with no body for success
+	c.Status(http.StatusOK)
 }
 
 // handleDelete handles DELETE requests
-func (h *S3Handler) handleDelete(c *gin.Context, s3Client *s3.Client, bucket, key string) {
+func (h *S3Handler) handleDelete(c *gin.Context, s3Client *s3.Client, bucket, key string, userInfo *auth.UserInfo) {
 	if key == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Key is required for DELETE"})
+		c.Header("Content-Type", "application/xml")
+		c.XML(http.StatusBadRequest, gin.H{
+			"Error": gin.H{
+				"Code":    "InvalidRequest",
+				"Message": "Key is required for DELETE",
+			},
+		})
 		return
 	}
 
@@ -343,17 +593,30 @@ func (h *S3Handler) handleDelete(c *gin.Context, s3Client *s3.Client, bucket, ke
 
 	if err != nil {
 		h.logger.WithError(err).Error("Failed to delete object from S3")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete object"})
+		c.Header("Content-Type", "application/xml")
+		c.XML(http.StatusInternalServerError, gin.H{
+			"Error": gin.H{
+				"Code":    "InternalError",
+				"Message": "Failed to delete object",
+			},
+		})
 		return
 	}
 
-	c.JSON(http.StatusNoContent, nil)
+	// S3 DELETE operations return 204 No Content for success
+	c.Status(http.StatusNoContent)
 }
 
 // handleHead handles HEAD requests
-func (h *S3Handler) handleHead(c *gin.Context, s3Client *s3.Client, bucket, key string) {
+func (h *S3Handler) handleHead(c *gin.Context, s3Client *s3.Client, bucket, key string, userInfo *auth.UserInfo) {
 	if key == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Key is required for HEAD"})
+		c.Header("Content-Type", "application/xml")
+		c.XML(http.StatusBadRequest, gin.H{
+			"Error": gin.H{
+				"Code":    "InvalidRequest",
+				"Message": "Key is required for HEAD",
+			},
+		})
 		return
 	}
 
@@ -365,7 +628,13 @@ func (h *S3Handler) handleHead(c *gin.Context, s3Client *s3.Client, bucket, key 
 
 	if err != nil {
 		h.logger.WithError(err).Error("Failed to head object from S3")
-		c.Status(http.StatusNotFound)
+		c.Header("Content-Type", "application/xml")
+		c.XML(http.StatusNotFound, gin.H{
+			"Error": gin.H{
+				"Code":    "NoSuchKey",
+				"Message": "The specified key does not exist",
+			},
+		})
 		return
 	}
 
@@ -387,45 +656,130 @@ func (h *S3Handler) handleHead(c *gin.Context, s3Client *s3.Client, bucket, key 
 }
 
 // handlePost handles POST requests (multipart upload initiation, etc.)
-func (h *S3Handler) handlePost(c *gin.Context, s3Client *s3.Client, bucket, key string) {
+func (h *S3Handler) handlePost(c *gin.Context, s3Client *s3.Client, bucket, key string, userInfo *auth.UserInfo) {
 	// For simplicity, we'll return not implemented
 	// You can extend this to handle multipart uploads
-	c.JSON(http.StatusNotImplemented, gin.H{"error": "POST operations not yet implemented"})
+	c.Header("Content-Type", "application/xml")
+	c.XML(http.StatusNotImplemented, gin.H{
+		"Error": gin.H{
+			"Code":    "NotImplemented",
+			"Message": "POST operations not yet implemented",
+		},
+	})
 }
 
 // handleListObjects lists objects in a bucket
 func (h *S3Handler) handleListObjects(c *gin.Context, s3Client *s3.Client, bucket string) {
 	prefix := c.Query("prefix")
 	delimiter := c.Query("delimiter")
+	maxKeys := c.Query("max-keys")
+	if maxKeys == "" {
+		maxKeys = "1000"
+	}
+
+	contentType := c.GetHeader("Content-Type")
+	h.logger.WithFields(logrus.Fields{
+		"bucket":      bucket,
+		"contentType": contentType,
+		"path":        c.Request.URL.Path,
+	}).Debug("handleListObjects called")
 
 	ctx := c.Request.Context()
 	result, err := s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 		Bucket:    aws.String(bucket),
 		Prefix:    aws.String(prefix),
 		Delimiter: aws.String(delimiter),
+		MaxKeys:   aws.Int32(1000), // Default max keys
 	})
 
 	if err != nil {
 		h.logger.WithError(err).WithField("bucket", bucket).Error("Failed to list objects from S3")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list objects"})
+		// Check if this is a web UI request (expects JSON)
+		if c.GetHeader("Content-Type") == "application/json" {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list objects"})
+			return
+		}
+		// Return S3-compatible error XML
+		c.Header("Content-Type", "application/xml")
+		c.XML(http.StatusInternalServerError, gin.H{
+			"Error": gin.H{
+				"Code":    "InternalError",
+				"Message": "Failed to list objects",
+			},
+		})
 		return
 	}
 
-	// Build response
-	objects := make([]map[string]interface{}, 0)
-	for _, obj := range result.Contents {
-		objects = append(objects, map[string]interface{}{
-			"key":           *obj.Key,
-			"size":          *obj.Size,
-			"last_modified": obj.LastModified.Format(time.RFC3339),
-			"etag":          *obj.ETag,
+	// Check if this is a web UI request (expects JSON response)
+	if c.GetHeader("Content-Type") == "application/json" {
+		// Return JSON response for web UI
+		objects := []gin.H{}
+
+		// Add contents
+		for _, obj := range result.Contents {
+			content := gin.H{
+				"key":          *obj.Key,
+				"lastModified": obj.LastModified.Format(time.RFC3339),
+				"etag":         *obj.ETag,
+				"size":         *obj.Size,
+				"storageClass": "STANDARD", // Default storage class
+			}
+			objects = append(objects, content)
+		}
+
+		// Add common prefixes (for directory-like listing)
+		folders := []string{}
+		for _, prefix := range result.CommonPrefixes {
+			if prefix.Prefix != nil {
+				folders = append(folders, *prefix.Prefix)
+			}
+		}
+
+		c.JSON(http.StatusOK, gin.H{
+			"objects":     objects,
+			"folders":     folders,
+			"isTruncated": result.IsTruncated,
+			"keyCount":    len(result.Contents),
+			"maxKeys":     maxKeys,
+			"prefix":      prefix,
+			"name":        bucket,
 		})
+		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{
-		"bucket":  bucket,
-		"prefix":  prefix,
-		"objects": objects,
-		"count":   len(objects),
-	})
+	// Build S3-compatible XML response
+	xmlResponse := gin.H{
+		"Name":           bucket,
+		"Prefix":         prefix,
+		"KeyCount":       len(result.Contents),
+		"MaxKeys":        maxKeys,
+		"IsTruncated":    result.IsTruncated,
+		"Contents":       []gin.H{},
+		"CommonPrefixes": []gin.H{},
+	}
+
+	// Add contents
+	for _, obj := range result.Contents {
+		content := gin.H{
+			"Key":          *obj.Key,
+			"LastModified": obj.LastModified.Format(time.RFC3339),
+			"ETag":         *obj.ETag,
+			"Size":         *obj.Size,
+			"StorageClass": "STANDARD", // Default storage class
+		}
+		xmlResponse["Contents"] = append(xmlResponse["Contents"].([]gin.H), content)
+	}
+
+	// Add common prefixes (for directory-like listing)
+	for _, prefix := range result.CommonPrefixes {
+		if prefix.Prefix != nil {
+			commonPrefix := gin.H{
+				"Prefix": *prefix.Prefix,
+			}
+			xmlResponse["CommonPrefixes"] = append(xmlResponse["CommonPrefixes"].([]gin.H), commonPrefix)
+		}
+	}
+
+	c.Header("Content-Type", "application/xml")
+	c.XML(http.StatusOK, xmlResponse)
 }

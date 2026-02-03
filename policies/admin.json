@@ -2,13 +2,14 @@
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "AdminFullAccess",
+      "Sid": "S3AdminFullAccess",
       "Effect": "Allow",
       "Action": [
         "s3:*"
       ],
       "Resource": [
-        "arn:aws:s3:::*"
+        "arn:aws:s3:::*",
+        "arn:aws:s3:::*/*"
       ]
     }
   ]

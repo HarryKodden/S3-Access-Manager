@@ -45,7 +45,8 @@ type EvaluationContext struct {
 	Key      string
 	Resource string
 	UserID   string
-	Roles    []string
+	Groups   []string
+	Policies []string // List of policy names that apply to the user
 }
 
 // Decision represents the result of policy evaluation
@@ -162,18 +163,19 @@ func (e *Engine) Evaluate(ctx *EvaluationContext) *Decision {
 		"bucket":   ctx.Bucket,
 		"key":      ctx.Key,
 		"resource": ctx.Resource,
-		"roles":    ctx.Roles,
+		"groups":   ctx.Groups,
+		"policies": ctx.Policies,
 		"user":     ctx.UserID,
 	}).Debug("Evaluating policies")
 
-	// Collect applicable policies based on roles
+	// Collect applicable policies based on user's applicable policies
 	applicablePolicies := make([]*Policy, 0)
-	matchedRoles := make([]string, 0)
+	matchedPolicies := make([]string, 0)
 
-	for _, role := range ctx.Roles {
-		if policy, exists := e.policies[role]; exists {
+	for _, policyName := range ctx.Policies {
+		if policy, exists := e.policies[policyName]; exists {
 			applicablePolicies = append(applicablePolicies, policy)
-			matchedRoles = append(matchedRoles, role)
+			matchedPolicies = append(matchedPolicies, policyName)
 		}
 	}
 
@@ -181,7 +183,7 @@ func (e *Engine) Evaluate(ctx *EvaluationContext) *Decision {
 		if e.config.DefaultDeny {
 			return &Decision{
 				Allowed: false,
-				Reason:  "No matching policies found for user roles",
+				Reason:  "No matching policies found for user",
 			}
 		} else {
 			return &Decision{
@@ -209,11 +211,11 @@ func (e *Engine) Evaluate(ctx *EvaluationContext) *Decision {
 			// Statement matches - check effect
 			if statement.Effect == "Deny" {
 				hasExplicitDeny = true
-				denyReason = fmt.Sprintf("Denied by policy %s", matchedRoles[i])
+				denyReason = fmt.Sprintf("Denied by policy %s", matchedPolicies[i])
 				break
 			} else if statement.Effect == "Allow" {
 				hasExplicitAllow = true
-				allowReason = fmt.Sprintf("Allowed by policy %s", matchedRoles[i])
+				allowReason = fmt.Sprintf("Allowed by policy %s", matchedPolicies[i])
 			}
 		}
 
@@ -227,7 +229,7 @@ func (e *Engine) Evaluate(ctx *EvaluationContext) *Decision {
 		return &Decision{
 			Allowed: false,
 			Reason:  denyReason,
-			Policy:  strings.Join(matchedRoles, ","),
+			Policy:  strings.Join(matchedPolicies, ","),
 		}
 	}
 
@@ -236,7 +238,7 @@ func (e *Engine) Evaluate(ctx *EvaluationContext) *Decision {
 		return &Decision{
 			Allowed: true,
 			Reason:  allowReason,
-			Policy:  strings.Join(matchedRoles, ","),
+			Policy:  strings.Join(matchedPolicies, ","),
 		}
 	}
 
@@ -244,7 +246,7 @@ func (e *Engine) Evaluate(ctx *EvaluationContext) *Decision {
 	return &Decision{
 		Allowed: false,
 		Reason:  "No explicit allow statement found",
-		Policy:  strings.Join(matchedRoles, ","),
+		Policy:  strings.Join(matchedPolicies, ","),
 	}
 }
 

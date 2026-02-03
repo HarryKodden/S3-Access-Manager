@@ -22,7 +22,7 @@ type Credential struct {
 	SecretKey    string                 `json:"secret_key"`
 	SessionToken string                 `json:"session_token,omitempty"` // For temporary STS credentials
 	RoleName     string                 `json:"role_name,omitempty"`     // IAM role name used for STS credentials
-	Roles        []string               `json:"roles,omitempty"`         // User-selected roles
+	Groups       []string               `json:"groups,omitempty"`        // User-selected groups
 	BackendData  map[string]interface{} `json:"backend_data,omitempty"`  // Backend-specific data (e.g., policy ARN for AWS)
 	CreatedAt    time.Time              `json:"created_at"`
 	LastUsedAt   time.Time              `json:"last_used_at,omitempty"`
@@ -56,7 +56,7 @@ func NewCredentialStore(storePath string, logger *logrus.Logger) (*CredentialSto
 }
 
 // Create creates a new credential for a user
-func (s *CredentialStore) Create(userID, name, description string, roles []string) (*Credential, error) {
+func (s *CredentialStore) Create(userID, name, description string, groups []string) (*Credential, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -71,19 +71,29 @@ func (s *CredentialStore) Create(userID, name, description string, roles []strin
 		return nil, fmt.Errorf("failed to generate secret key: %w", err)
 	}
 
-	return s.createCredential(userID, name, description, roles, accessKey, secretKey, "", "", nil)
+	return s.createCredential(userID, name, description, groups, accessKey, secretKey, "", "", nil)
 }
 
 // CreateWithKeys creates a new credential with provided access/secret keys (for IAM integration)
-func (s *CredentialStore) CreateWithKeys(userID, name, description string, roles []string, accessKey, secretKey, sessionToken, roleName string, backendData map[string]interface{}) (*Credential, error) {
+func (s *CredentialStore) CreateWithKeys(userID, name, description string, groups []string, accessKey, secretKey, sessionToken, roleName string, backendData map[string]interface{}) (*Credential, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return s.createCredential(userID, name, description, roles, accessKey, secretKey, sessionToken, roleName, backendData)
+	return s.createCredential(userID, name, description, groups, accessKey, secretKey, sessionToken, roleName, backendData)
+}
+
+// generateID generates a unique ID
+func generateID() string {
+	bytes := make([]byte, 16)
+	if _, err := rand.Read(bytes); err != nil {
+		// Fall back to timestamp-based ID if random generation fails
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return base64.RawURLEncoding.EncodeToString(bytes)
 }
 
 // createCredential is the internal method to create a credential (caller must hold lock)
-func (s *CredentialStore) createCredential(userID, name, description string, roles []string, accessKey, secretKey, sessionToken, roleName string, backendData map[string]interface{}) (*Credential, error) {
+func (s *CredentialStore) createCredential(userID, name, description string, groups []string, accessKey, secretKey, sessionToken, roleName string, backendData map[string]interface{}) (*Credential, error) {
 	// Create credential
 	cred := &Credential{
 		ID:           generateID(),
@@ -93,7 +103,7 @@ func (s *CredentialStore) createCredential(userID, name, description string, rol
 		SecretKey:    secretKey,
 		SessionToken: sessionToken,
 		RoleName:     roleName,
-		Roles:        roles,
+		Groups:       groups,
 		BackendData:  backendData,
 		CreatedAt:    time.Now(),
 		Description:  description,
@@ -161,21 +171,21 @@ func (s *CredentialStore) ListByUser(userID string) ([]*Credential, error) {
 	return credentials, nil
 }
 
-// ListByRoles lists all credentials that use any of the specified roles
-func (s *CredentialStore) ListByRoles(roleNames []string) ([]*Credential, error) {
+// ListByGroups lists all credentials that use any of the specified groups
+func (s *CredentialStore) ListByGroups(groupNames []string) ([]*Credential, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	roleSet := make(map[string]bool)
-	for _, role := range roleNames {
-		roleSet[role] = true
+	groupSet := make(map[string]bool)
+	for _, group := range groupNames {
+		groupSet[group] = true
 	}
 
 	var credentials []*Credential
 	for _, cred := range s.credentials {
-		// Check if credential uses any of the specified roles
-		for _, credRole := range cred.Roles {
-			if roleSet[credRole] {
+		// Check if credential uses any of the specified groups
+		for _, credGroup := range cred.Groups {
+			if groupSet[credGroup] {
 				credentials = append(credentials, cred)
 				break
 			}
@@ -257,8 +267,8 @@ func (s *CredentialStore) UpdateLastUsed(accessKey string) error {
 	return nil
 }
 
-// UpdateRoles updates the roles for a credential
-func (s *CredentialStore) UpdateRoles(accessKey string, roles []string) error {
+// UpdateGroups updates the groups for a credential
+func (s *CredentialStore) UpdateGroups(accessKey string, groups []string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -267,7 +277,7 @@ func (s *CredentialStore) UpdateRoles(accessKey string, roles []string) error {
 		return fmt.Errorf("credential not found")
 	}
 
-	cred.Roles = roles
+	cred.Groups = groups
 	return s.save()
 }
 
@@ -300,6 +310,25 @@ func (s *CredentialStore) Validate(accessKey, secretKey string) (*Credential, er
 	}
 
 	return cred, nil
+}
+
+// CredentialExists checks if a credential with the given name exists for a user
+func (s *CredentialStore) CredentialExists(userID, name string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	accessKeys, exists := s.userIndex[userID]
+	if !exists {
+		return false
+	}
+
+	for _, accessKey := range accessKeys {
+		if cred, exists := s.credentials[accessKey]; exists && cred.Name == name {
+			return true
+		}
+	}
+
+	return false
 }
 
 // Load loads credentials from disk
@@ -387,12 +416,42 @@ func generateKey(prefix string, length int) (string, error) {
 	return prefix + encoded, nil
 }
 
-// generateID generates a unique ID
-func generateID() string {
-	bytes := make([]byte, 16)
-	if _, err := rand.Read(bytes); err != nil {
-		// Fall back to timestamp-based ID if random generation fails
-		return fmt.Sprintf("%d", time.Now().UnixNano())
+// DeleteCredential removes a credential by name for a specific user
+func (s *CredentialStore) DeleteCredential(credentialName string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Find the credential by name
+	var accessKeyToDelete string
+	var found bool
+	for accessKey, cred := range s.credentials {
+		if cred.Name == credentialName {
+			accessKeyToDelete = accessKey
+			found = true
+			break
+		}
 	}
-	return base64.RawURLEncoding.EncodeToString(bytes)
+
+	if !found {
+		return fmt.Errorf("credential not found")
+	}
+
+	// Remove from credentials map
+	delete(s.credentials, accessKeyToDelete)
+
+	// Remove from user index
+	if accessKeys, exists := s.userIndex[s.credentials[accessKeyToDelete].UserID]; exists {
+		for i, key := range accessKeys {
+			if key == accessKeyToDelete {
+				s.userIndex[s.credentials[accessKeyToDelete].UserID] = append(accessKeys[:i], accessKeys[i+1:]...)
+				break
+			}
+		}
+		// Remove user entry if no credentials left
+		if len(s.userIndex[s.credentials[accessKeyToDelete].UserID]) == 0 {
+			delete(s.userIndex, s.credentials[accessKeyToDelete].UserID)
+		}
+	}
+
+	return s.save()
 }

@@ -287,9 +287,50 @@ func ValidatePolicyJSON(policy map[string]interface{}) error {
 			return fmt.Errorf("statement[%d] missing required field: Action", i)
 		}
 
+		// Validate actions are S3-only
+		if err := validateS3OnlyActions(stmtMap["Action"], i); err != nil {
+			return err
+		}
+
 		// Check Resource
 		if _, hasResource := stmtMap["Resource"]; !hasResource {
 			return fmt.Errorf("statement[%d] missing required field: Resource", i)
+		}
+	}
+
+	return nil
+}
+
+// validateS3OnlyActions ensures all actions are S3-related (not IAM, EC2, etc.)
+func validateS3OnlyActions(actions interface{}, statementIndex int) error {
+	var actionList []string
+
+	// Handle both string and array of strings
+	switch v := actions.(type) {
+	case string:
+		actionList = []string{v}
+	case []interface{}:
+		for _, action := range v {
+			if actionStr, ok := action.(string); ok {
+				actionList = append(actionList, actionStr)
+			} else {
+				return fmt.Errorf("statement[%d] Action must be string or array of strings", statementIndex)
+			}
+		}
+	default:
+		return fmt.Errorf("statement[%d] Action must be string or array of strings", statementIndex)
+	}
+
+	// Check each action
+	for _, action := range actionList {
+		// Allow wildcards for S3
+		if action == "s3:*" {
+			continue
+		}
+
+		// Check if action starts with "s3:"
+		if len(action) < 3 || action[:3] != "s3:" {
+			return fmt.Errorf("statement[%d] contains non-S3 action '%s'. Only S3 actions (s3:*) are allowed. IAM, EC2, and other service actions are not permitted", statementIndex, action)
 		}
 	}
 

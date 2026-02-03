@@ -33,7 +33,7 @@ func Sync(syncService *sync.SyncService, logger *logrus.Logger) gin.HandlerFunc 
 			if err := syncService.SyncUser(context.Background(), userInfo); err != nil {
 				logger.WithError(err).WithFields(logrus.Fields{
 					"username": userInfo.Email,
-					"roles":    userInfo.Roles,
+					"groups":   userInfo.Groups,
 				}).Warn("Failed to sync IAM user/policies")
 			}
 		}()

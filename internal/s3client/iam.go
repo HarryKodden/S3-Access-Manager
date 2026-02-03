@@ -317,6 +317,56 @@ func (c *IAMClient) GetAccountID(ctx context.Context) (string, error) {
 	return *result.Account, nil
 }
 
+// CreateRole creates an IAM role with the specified policy document
+func (c *IAMClient) CreateRole(ctx context.Context, roleName string, policyDoc map[string]interface{}) error {
+	policyJSON, err := json.Marshal(policyDoc)
+	if err != nil {
+		return fmt.Errorf("failed to marshal policy document: %w", err)
+	}
+
+	// Create assume role policy document that allows the current user to assume this role
+	assumeRolePolicy := map[string]interface{}{
+		"Version": "2012-10-17",
+		"Statement": []map[string]interface{}{
+			{
+				"Effect": "Allow",
+				"Principal": map[string]interface{}{
+					"AWS": "arn:aws:iam::*:user/*", // Allow any user to assume this role (you may want to restrict this)
+				},
+				"Action": "sts:AssumeRole",
+			},
+		},
+	}
+
+	assumeRoleJSON, err := json.Marshal(assumeRolePolicy)
+	if err != nil {
+		return fmt.Errorf("failed to marshal assume role policy: %w", err)
+	}
+
+	_, err = c.client.CreateRole(ctx, &iam.CreateRoleInput{
+		RoleName:                 aws.String(roleName),
+		AssumeRolePolicyDocument: aws.String(string(assumeRoleJSON)),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create role: %w", err)
+	}
+
+	// Attach the policy as an inline policy
+	_, err = c.client.PutRolePolicy(ctx, &iam.PutRolePolicyInput{
+		RoleName:       aws.String(roleName),
+		PolicyName:     aws.String(fmt.Sprintf("%s-policy", roleName)),
+		PolicyDocument: aws.String(string(policyJSON)),
+	})
+	if err != nil {
+		// Try to clean up the role if policy attachment fails
+		c.client.DeleteRole(ctx, &iam.DeleteRoleInput{RoleName: aws.String(roleName)})
+		return fmt.Errorf("failed to attach role policy: %w", err)
+	}
+
+	c.logger.WithField("role_name", roleName).Info("Created IAM role with policy")
+	return nil
+}
+
 // DeleteRole deletes an IAM role
 func (c *IAMClient) DeleteRole(ctx context.Context, roleName string) error {
 	_, err := c.client.DeleteRole(ctx, &iam.DeleteRoleInput{

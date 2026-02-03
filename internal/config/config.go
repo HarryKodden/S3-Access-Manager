@@ -17,6 +17,8 @@ type Config struct {
 	S3         S3Config         `yaml:"s3"`
 	Policies   PoliciesConfig   `yaml:"policies"`
 	Roles      RolesConfig      `yaml:"roles"`
+	SCIMGroups SCIMGroupsConfig `yaml:"groups"`
+	SCIMUsers  SCIMUsersConfig  `yaml:"users"`
 	Logging    LoggingConfig    `yaml:"logging"`
 	Security   SecurityConfig   `yaml:"security"`
 	Monitoring MonitoringConfig `yaml:"monitoring"`
@@ -25,10 +27,11 @@ type Config struct {
 
 // ServerConfig contains HTTP server settings
 type ServerConfig struct {
-	Host         string        `yaml:"host"`
-	Port         int           `yaml:"port"`
-	ReadTimeout  time.Duration `yaml:"read_timeout"`
-	WriteTimeout time.Duration `yaml:"write_timeout"`
+	Host           string        `yaml:"host"`
+	Port           int           `yaml:"port"`
+	ReadTimeout    time.Duration `yaml:"read_timeout"`
+	WriteTimeout   time.Duration `yaml:"write_timeout"`
+	MaxHeaderBytes int           `yaml:"max_header_bytes"` // Maximum header size in bytes
 }
 
 // OIDCConfig contains OIDC authentication settings
@@ -37,7 +40,7 @@ type OIDCConfig struct {
 	ClientID        string        `yaml:"client_id"`
 	ClientSecret    string        `yaml:"client_secret"`
 	Scopes          string        `yaml:"scopes"`
-	RolesClaim      string        `yaml:"roles_claim"`
+	GroupsClaim     string        `yaml:"groups_claim"`
 	UserClaim       string        `yaml:"user_claim"`
 	EmailClaim      string        `yaml:"email_claim"`
 	SessionCacheTTL time.Duration `yaml:"session_cache_ttl"` // Time before revalidating token, default 15 minutes
@@ -69,6 +72,16 @@ type PoliciesConfig struct {
 // RolesConfig contains role management settings
 type RolesConfig struct {
 	Directory string `yaml:"directory"` // Directory for role definitions
+}
+
+// SCIMGroupsConfig contains SCIM group settings
+type SCIMGroupsConfig struct {
+	Directory string `yaml:"directory"` // Directory for SCIM group data
+}
+
+// UsersConfig contains user provisioning settings
+type SCIMUsersConfig struct {
+	Directory string `yaml:"directory"` // Directory for SCIM user data
 }
 
 // LoggingConfig contains logging settings
@@ -138,13 +151,16 @@ func Load(path string) (*Config, error) {
 		cfg.Server.Port = 9000
 	}
 	if cfg.Server.ReadTimeout == 0 {
-		cfg.Server.ReadTimeout = 30 * time.Second
+		cfg.Server.ReadTimeout = 15 * time.Second // Reduced from 30s for better concurrency
 	}
 	if cfg.Server.WriteTimeout == 0 {
-		cfg.Server.WriteTimeout = 30 * time.Second
+		cfg.Server.WriteTimeout = 15 * time.Second // Reduced from 30s for better concurrency
 	}
-	if cfg.OIDC.RolesClaim == "" {
-		cfg.OIDC.RolesClaim = "Roles"
+	if cfg.Server.MaxHeaderBytes == 0 {
+		cfg.Server.MaxHeaderBytes = 1 << 20 // 1MB default max header size
+	}
+	if cfg.OIDC.GroupsClaim == "" {
+		cfg.OIDC.GroupsClaim = "Groups"
 	}
 	if cfg.OIDC.UserClaim == "" {
 		cfg.OIDC.UserClaim = "sub"
@@ -166,6 +182,12 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Roles.Directory == "" {
 		cfg.Roles.Directory = "./data/roles"
+	}
+	if cfg.SCIMGroups.Directory == "" {
+		cfg.SCIMGroups.Directory = "./data/Groups"
+	}
+	if cfg.SCIMUsers.Directory == "" {
+		cfg.SCIMUsers.Directory = "./data/Users"
 	}
 	if cfg.Logging.Level == "" {
 		cfg.Logging.Level = "info"
@@ -214,8 +236,8 @@ func loadOIDCEnvVars(oidcCfg *OIDCConfig) error {
 	if scopes := os.Getenv("OIDC_SCOPES"); scopes != "" {
 		oidcCfg.Scopes = scopes
 	}
-	if rolesClaim := os.Getenv("OIDC_ROLES_CLAIM"); rolesClaim != "" {
-		oidcCfg.RolesClaim = rolesClaim
+	if groupsClaim := os.Getenv("OIDC_GROUPS_CLAIM"); groupsClaim != "" {
+		oidcCfg.GroupsClaim = groupsClaim
 	}
 	if userClaim := os.Getenv("OIDC_USER_CLAIM"); userClaim != "" {
 		oidcCfg.UserClaim = userClaim
