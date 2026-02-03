@@ -53,32 +53,6 @@ func (u *RoleManager) ListRoles(ctx context.Context) ([]string, error) {
 	return roles, nil
 }
 
-// getFullRoleName returns the full role name (with RGW prefix) for a given short name
-func (u *RoleManager) getFullRoleName(ctx context.Context, shortName string) (string, error) {
-	stdout, stderr, err := u.client.RunAwsCliCommand(u.logger, "iam", "list-roles", "--output", "json")
-	if err != nil {
-		return "", fmt.Errorf("failed to run aws iam list-roles: %w (stderr: %s)", err, string(stderr))
-	}
-
-	var result struct {
-		Roles []struct {
-			RoleName string `json:"RoleName"`
-		} `json:"Roles"`
-	}
-	if err := json.Unmarshal(stdout, &result); err != nil {
-		return "", fmt.Errorf("failed to parse aws output: %w", err)
-	}
-
-	for _, role := range result.Roles {
-		// Check if this role matches (either exact match or ends with $shortName)
-		if role.RoleName == shortName || (strings.HasSuffix(role.RoleName, "$"+shortName)) {
-			return role.RoleName, nil
-		}
-	}
-
-	return "", fmt.Errorf("role '%s' not found", shortName)
-}
-
 // CreateRole creates an IAM Role with the combined policy document
 func (u *RoleManager) CreateRole(ctx context.Context, roleName string, combinedPolicyDoc map[string]interface{}) error {
 	// Default assume role policy allowing the gateway to assume the role

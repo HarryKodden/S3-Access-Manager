@@ -9,13 +9,34 @@ services:
       - ISSUER=${OIDC_ISSUER}
       - CLIENT_ID=${OIDC_CLIENT_ID}
       - CLIENT_SECRET=${OIDC_CLIENT_SECRET}
-      - ROLES_CLAIM=${OIDC_ROLES_CLAIM}
+      - ROLES_CLAIM=Groups
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8888/.well-known/openid-configuration"]
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 10s
+
+  # SCIM Server - For user and group provisioning
+  scim:
+    image: harrykodden/scim
+    expose:
+      - "8000"
+    network_mode: host
+    volumes:
+      - ./data:/app/data
+    env_file:
+      - .env
+    environment:
+      - DATA_PATH=/app/data
+      - API_KEY=${SCIM_API_KEY}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
       start_period: 10s
 
   # S3 Access Manager - Main application serving frontend and API

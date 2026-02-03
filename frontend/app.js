@@ -11,12 +11,9 @@ const CONFIG = {
 const state = {
     token: null,
     userInfo: null,
-    currentBucket: null,
-    currentPrefix: '',
     credentials: [],
     selectedCredential: null,  // Selected credential for S3 operations
-    actualIsAdmin: false,      // Actual admin status from backend
-    simulatedIsAdmin: true,    // Simulated admin status (togglable)
+    actualIsAdmin: false,      // Admin status from backend
     loadingCount: 0            // Counter for concurrent API calls
 };
 
@@ -106,6 +103,10 @@ async function validateTokenAndShowDashboard() {
         const userRoles = response.user_roles || [];
         state.userRoles = userRoles;
         state.actualIsAdmin = response.is_admin || false;
+        state.userGroups = response.user_groups || [];
+        
+        // Store admin status
+        localStorage.setItem('is_admin', state.actualIsAdmin.toString());
         
         showDashboard();
         const username = state.userInfo.name || state.userInfo.email || state.userInfo.sub || 'User';
@@ -246,17 +247,16 @@ async function handleOIDCCallback(code, receivedState) {
                 state.userInfo.name || state.userInfo.email || state.userInfo.sub || 'User';
         }
         
+        // Check admin status - will be set by credentials call
+        state.actualIsAdmin = false;
+        
+        // Load initial dashboard data
+        checkGatewayHealth();
+        loadCredentials();
+        
         // Show welcome message with username
         const username = state.userInfo.name || state.userInfo.email || state.userInfo.sub || 'User';
         showToast(`Welcome ${username}!`, 'success');
-        
-        // Load data after a short delay to ensure UI is ready
-        setTimeout(() => {
-            loadBuckets();
-            // loadCredentials(); // Removed to load only when tab is selected, similar to users
-            // Add redirect to root to simulate refresh
-            window.location.href = '/';
-        }, 500);
         
     } catch (error) {
         console.error('OIDC callback error:', error);
@@ -295,21 +295,7 @@ function setupEventListeners() {
     
     // Admin mode toggle
     const adminToggle = document.getElementById('admin-mode-toggle');
-    if (adminToggle) {
-        adminToggle.addEventListener('change', (e) => {
-            state.simulatedIsAdmin = e.target.checked;
-            const label = document.getElementById('admin-mode-label');
-            if (label) {
-                label.textContent = e.target.checked ? 'Admin View' : 'Regular User View';
-            }
-            updateUIForAdminMode();
-            // Reload current tab to reflect changes
-            const activeTab = document.querySelector('.tab.active');
-            if (activeTab) {
-                switchTab(activeTab.dataset.tab);
-            }
-        });
-    }
+    // Admin toggle removed - admin status is now determined by backend
     
     // Secret key visibility toggle
     const toggleSecretBtn = document.getElementById('toggle-secret-visibility');
@@ -330,13 +316,7 @@ function setupEventListeners() {
     document.getElementById('update-credentials-btn').addEventListener('click', updateAllCredentials);
     document.getElementById('confirm-create-credential').addEventListener('click', handleCreateCredential);
     document.getElementById('confirm-save-policy').addEventListener('click', savePolicy);
-    document.getElementById('confirm-save-role').addEventListener('click', saveRole);
-    
-    // Buckets
-    document.getElementById('create-bucket-btn').addEventListener('click', () => {
-        showModal('create-bucket-modal');
-    });
-    document.getElementById('confirm-create-bucket').addEventListener('click', handleCreateBucket);
+    document.getElementById('confirm-save-group').addEventListener('click', saveRole);
     
     // Modal close buttons
     document.querySelectorAll('.modal-close, .modal-cancel').forEach(btn => {
@@ -401,25 +381,34 @@ function showDashboard() {
     // Update user info display
     if (state.userInfo) {
         const userEmail = state.userInfo.email || state.userInfo.sub || 'User';
-        const roles = state.userRoles && state.userRoles.length > 0 
-            ? ` (${state.userRoles.join(', ')})` 
-            : '';
-        document.getElementById('user-info').textContent = userEmail + roles;
+        const isAdmin = state.actualIsAdmin ? ' (Admin)' : '';
+        document.getElementById('user-info').textContent = userEmail + isAdmin;
     }
+    
+    // Update admin UI elements
+    updateAdminUI();
     
     // Load initial data
     checkGatewayHealth();
     loadCredentials();
 }
 
-// Update UI based on admin mode toggle
-function updateUIForAdminMode() {
-    const isAdmin = state.actualIsAdmin && state.simulatedIsAdmin;
+// Update UI based on admin status
+function updateAdminUI() {
+    const isAdmin = state.actualIsAdmin;
     
-    // Update all admin-only elements
+    // Show/hide admin-only elements
     document.querySelectorAll('.admin-only').forEach(el => {
         el.style.display = isAdmin ? '' : 'none';
     });
+    
+    // If not admin and on an admin-only tab, switch to credentials tab
+    if (!isAdmin) {
+        const activeTab = document.querySelector('.tab.active');
+        if (activeTab && activeTab.classList.contains('admin-only')) {
+            showTab('credentials');
+        }
+    }
 }
 
 // OIDC Helper Functions
@@ -562,10 +551,6 @@ function switchTab(tabName) {
         case 'roles':
             loadRoles();
             break;
-        case 'buckets':
-            loadBucketsCredentialSelector();
-            loadBuckets();
-            break;
         case 'users':
             loadUsers();
             break;
@@ -594,8 +579,8 @@ async function apiCall(endpoint, options = {}) {
         console.log('API call without auth:', endpoint);
     }
     
-    // Add credential header for S3 operations (buckets, objects)
-    if (state.selectedCredential && (endpoint.startsWith('/s3/') || endpoint.includes('/settings/buckets'))) {
+    // Add credential header for S3 operations
+    if (state.selectedCredential && endpoint.startsWith('/s3/')) {
         headers['X-S3-Credential-AccessKey'] = state.selectedCredential;
         console.log('Adding credential header:', state.selectedCredential);
     }
@@ -707,20 +692,22 @@ async function loadCredentials() {
         state.userRoles = userRoles;
         state.actualIsAdmin = isAdmin;
         state.isAdmin = isAdmin; // Keep for backward compatibility
+        state.userGroups = response.user_groups || []; // Update user groups from response
         
-        // Show/hide admin toggle (only for actual admins)
+        console.log('Admin status and groups loaded:', {
+            isAdmin: state.actualIsAdmin,
+            userGroups: state.userGroups,
+            userRoles: state.userRoles
+        });
+        
+        // Admin toggle container hidden - admin status determined by backend only
         const toggleContainer = document.getElementById('admin-toggle-container');
         if (toggleContainer) {
-            toggleContainer.style.display = isAdmin ? 'flex' : 'none';
-            // Initialize toggle state
-            const toggle = document.getElementById('admin-mode-toggle');
-            if (toggle && state.actualIsAdmin) {
-                toggle.checked = state.simulatedIsAdmin;
-            }
+            toggleContainer.style.display = 'none';
         }
         
-        // Update UI based on admin mode
-        updateUIForAdminMode();
+        // Update UI based on admin status
+        updateAdminUI();
         
         // Update stored user info with backend's authoritative data
         if (userInfo.subject || userInfo.email) {
@@ -804,21 +791,31 @@ async function loadCredentials() {
 
 async function loadAvailableRolesForCredential() {
     const container = document.getElementById('cred-roles');
-    if (!container) return;
+    if (!container) {
+        console.warn('cred-roles container not found');
+        return;
+    }
     
+    console.log('Loading available roles for credential creation');
     container.innerHTML = '<p style="color: var(--text-secondary);">Loading roles...</p>';
     
     try {
         const response = await apiCall('/settings/roles');
-        let roles = response.roles || [];
+        console.log('Roles API response:', response);
+        let roles = response.groups || [];  // Backend returns 'groups' not 'roles'
         
-        // Use simulated admin status for filtering
-        const isAdmin = state.actualIsAdmin && state.simulatedIsAdmin;
+        // Check if user is admin
+        const isAdmin = state.actualIsAdmin;
         
-        // Filter roles based on user roles
-        // Admin sees all roles, regular users see only their assigned roles
-        if (!isAdmin && state.userRoles) {
-            roles = roles.filter(role => state.userRoles.includes(role.name));
+        // Filter roles based on user's OIDC group membership
+        // Admin sees all roles, regular users see only roles for groups they belong to
+        if (!isAdmin && state.userGroups) {
+            roles = roles.filter(role => state.userGroups.includes(role.scim_id));
+            
+            console.log('Filtered roles for non-admin user:', {
+                userGroups: state.userGroups,
+                availableRoles: roles.map(r => r.name)
+            });
         }
         
         container.innerHTML = '';
@@ -837,7 +834,7 @@ async function loadAvailableRolesForCredential() {
                 
                 const checkbox = document.createElement('input');
                 checkbox.type = 'checkbox';
-                checkbox.value = role.name;
+                checkbox.value = role.scim_id || role.name;  // Use SCIM ID for backend validation
                 checkbox.className = 'role-checkbox';
                 checkbox.style.flex = '0 0 10%';
                 checkbox.style.margin = '0';
@@ -867,11 +864,17 @@ async function loadAvailableRolesForCredential() {
                 container.appendChild(label);
             });
         } else {
-            container.innerHTML = '<p style="color: var(--text-secondary); font-size: 0.875rem;">No roles available</p>';
+            const message = isAdmin 
+                ? 'No roles available' 
+                : 'No roles available for your groups. Contact your administrator.';
+            container.innerHTML = `<p style="color: var(--text-secondary); font-size: 0.875rem;">${message}</p>`;
         }
     } catch (error) {
         console.error('Failed to load roles:', error);
-        container.innerHTML = '<p style="color: var(--danger-color); font-size: 0.875rem;">Failed to load roles</p>';
+        const errorMsg = error.message.includes('403') || error.message.includes('Forbidden')
+            ? 'You do not have permission to view roles'
+            : 'Failed to load roles';
+        container.innerHTML = `<p style="color: var(--danger-color); font-size: 0.875rem;">${errorMsg}</p>`;
     }
 }
 
@@ -907,8 +910,8 @@ async function inspectCredential(accessKey) {
         
         // Show roles as badges
         const policiesContainer = document.getElementById('inspect-cred-policies');
-        if (fullCred.roles && fullCred.roles.length > 0) {
-            policiesContainer.innerHTML = fullCred.roles.map(role => `
+        if (fullCred.groups && fullCred.groups.length > 0) {
+            policiesContainer.innerHTML = fullCred.groups.map(role => `
                 <span style="background-color: var(--primary-color); color: white; padding: 0.25rem 0.75rem; border-radius: 12px; font-size: 0.875rem;">
                     ${role}
                 </span>
@@ -959,7 +962,7 @@ async function handleCreateCredential() {
             body: JSON.stringify({
                 name,
                 description,
-                roles: selectedRoles  // Send array of selected roles
+                groups: selectedRoles  // Backend expects 'groups' field
             })
         });
         
@@ -1169,612 +1172,7 @@ function toggleSecretKeyVisibility() {
     }
 }
 
-// Credential Selector for Buckets
-async function loadBucketsCredentialSelector() {
-    const selectEl = document.getElementById('bucket-credential-select');
-    const infoEl = document.getElementById('selected-credential-info');
-    const nameEl = document.getElementById('selected-credential-name');
-    
-    try {
-        const response = await apiCall('/settings/credentials');
-        const credentials = response.credentials || [];
-        
-        // Populate dropdown
-        selectEl.innerHTML = '<option value="">-- Select a credential --</option>';
-        credentials.forEach(cred => {
-            const option = document.createElement('option');
-            option.value = cred.access_key;
-            option.textContent = `${cred.name} (${cred.access_key})`;
-            option.dataset.name = cred.name;
-            selectEl.appendChild(option);
-        });
-        
-        // Restore previously selected credential from localStorage
-        const savedCredential = localStorage.getItem('selected_s3_credential');
-        if (savedCredential && credentials.some(c => c.access_key === savedCredential)) {
-            selectEl.value = savedCredential;
-            state.selectedCredential = savedCredential;
-            updateSelectedCredentialInfo();
-        }
-        
-        // Handle selection change
-        selectEl.onchange = function() {
-            const accessKey = this.value;
-            if (accessKey) {
-                state.selectedCredential = accessKey;
-                localStorage.setItem('selected_s3_credential', accessKey);
-                updateSelectedCredentialInfo();
-                showToast('Credential selected for S3 operations', 'success');
-            } else {
-                state.selectedCredential = null;
-                localStorage.removeItem('selected_s3_credential');
-                infoEl.style.display = 'none';
-                showToast('No credential selected - S3 operations will fail', 'warning');
-            }
-        };
-        
-    } catch (error) {
-        console.error('Failed to load credentials for selector:', error);
-        selectEl.innerHTML = '<option value="">Failed to load credentials</option>';
-    }
-    
-    function updateSelectedCredentialInfo() {
-        const selectEl = document.getElementById('bucket-credential-select');
-        const selectedOption = selectEl.options[selectEl.selectedIndex];
-        
-        if (selectedOption && selectedOption.value) {
-            const name = selectedOption.dataset.name;
-            
-            nameEl.textContent = name;
-            infoEl.style.display = 'block';
-        } else {
-            infoEl.style.display = 'none';
-        }
-    }
-}
-
-// Bucket Management
-async function loadBuckets() {
-    const listEl = document.getElementById('buckets-list');
-    listEl.innerHTML = '<div class="empty-state">Loading buckets...</div>';
-    
-    try {
-        const response = await apiCall('/settings/buckets');
-        const buckets = response.buckets || [];
-        
-        if (buckets.length === 0) {
-            listEl.innerHTML = `
-                <div class="empty-state">
-                    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
-                    </svg>
-                    <p>No buckets yet</p>
-                    <p style="font-size: 0.875rem; margin-top: 0.5rem;">Create your first bucket to store data</p>
-                </div>
-            `;
-        } else {
-            listEl.innerHTML = buckets.map(bucket => `
-                <div class="credential-card">
-                    <div class="credential-info">
-                        <h4>${bucket.name}</h4>
-                        <div class="credential-meta">
-                            <span>Created: ${new Date(bucket.created_at).toLocaleDateString()}</span>
-                        </div>
-                    </div>
-                    <div class="credential-actions">
-                        <button class="btn-icon" onclick="showUploadModal('${bucket.name}')" title="Upload">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-                                <polyline points="17 8 12 3 7 8"></polyline>
-                                <line x1="12" y1="3" x2="12" y2="15"></line>
-                            </svg>
-                        </button>
-                        <button class="btn-icon" onclick="inspectBucket('${bucket.name}')" title="Inspect">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
-                            </svg>
-                        </button>
-                        <button class="btn-icon btn-danger" onclick="deleteBucket('${bucket.name}')" title="Delete">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                                <polyline points="3 6 5 6 21 6"></polyline>
-                                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
-                            </svg>
-                        </button>
-                    </div>
-                </div>
-            `).join('');
-        }
-    } catch (error) {
-        listEl.innerHTML = `
-            <div class="empty-state">
-                <p style="color: var(--danger-color);">Failed to load buckets</p>
-                <p style="font-size: 0.875rem; margin-top: 0.5rem;">${error.message}</p>
-            </div>
-        `;
-    }
-}
-
-async function handleCreateBucket() {
-    const name = document.getElementById('new-bucket-name').value;
-    
-    if (!name) {
-        showToast('Please enter a bucket name', 'error');
-        return;
-    }
-    
-    // Validate bucket name (basic S3 naming rules)
-    const bucketNameRegex = /^[a-z0-9][a-z0-9.-]*[a-z0-9]$/;
-    if (!bucketNameRegex.test(name) || name.length < 3 || name.length > 63) {
-        showToast('Invalid bucket name. Must be 3-63 characters, lowercase, and start/end with letter or number', 'error');
-        return;
-    }
-    
-    try {
-        await apiCall('/settings/buckets', {
-            method: 'POST',
-            body: JSON.stringify({ name })
-        });
-        
-        hideModals();
-        showToast('Bucket created successfully!', 'success');
-        loadBuckets();
-        
-        // Clear form
-        document.getElementById('new-bucket-name').value = '';
-    } catch (error) {
-        showToast('Failed to create bucket: ' + error.message, 'error');
-    }
-}
-
-async function deleteBucket(name) {
-    if (!confirm(`Are you sure you want to delete bucket "${name}"? The bucket must be empty.`)) {
-        return;
-    }
-    
-    try {
-        await apiCall(`/settings/buckets/${name}`, { method: 'DELETE' });
-        showToast('Bucket deleted', 'success');
-        loadBuckets();
-    } catch (error) {
-        showToast('Failed to delete bucket: ' + error.message, 'error');
-    }
-}
-
-// Bucket Inspection
-async function inspectBucket(bucketName) {
-    state.currentBucket = bucketName;
-    state.currentPrefix = '';
-    
-    document.getElementById('inspect-bucket-title').textContent = `Bucket: ${bucketName}`;
-    showModal('inspect-bucket-modal');
-    
-    await loadBucketObjects();
-}
-
-async function loadBucketObjects(prefix = '') {
-    state.currentPrefix = prefix;
-    const listEl = document.getElementById('bucket-objects-list');
-    const breadcrumb = document.getElementById('bucket-breadcrumb');
-    
-    // Update breadcrumb
-    if (!prefix) {
-        breadcrumb.innerHTML = `<span style="color: var(--text-secondary);">/ (root)</span>`;
-    } else {
-        const parts = prefix.split('/').filter(p => p);
-        let path = '';
-        breadcrumb.innerHTML = `
-            <a href="#" onclick="loadBucketObjects(''); return false;" style="color: var(--primary-color); text-decoration: none;">/</a>
-            ${parts.map((part, idx) => {
-                path += part + '/';
-                const isLast = idx === parts.length - 1;
-                if (isLast) {
-                    return `<span style="color: var(--text-secondary);"> / ${part}</span>`;
-                }
-                return `<a href="#" onclick="loadBucketObjects('${path}'); return false;" style="color: var(--primary-color); text-decoration: none;"> / ${part}</a>`;
-            }).join('')}
-        `;
-    }
-    
-    listEl.innerHTML = '<div class="empty-state">Loading objects...</div>';
-    
-    try {
-        const response = await apiCall(`/s3/${state.currentBucket}${prefix ? '?prefix=' + prefix : ''}`);
-        
-        console.log('loadBucketObjects response:', response);
-        
-        // Parse JSON response from backend
-        const objects = response.objects || [];
-        
-        // Separate folders and files
-        const folders = [];
-        const files = [];
-        
-        objects.forEach(obj => {
-            if (obj.key.endsWith('/')) {
-                // It's a folder
-                folders.push(obj.key);
-            } else {
-                // It's a file
-                files.push({
-                    key: obj.key,
-                    size: obj.size || 0,
-                    modified: obj.last_modified || obj.lastModified || new Date().toISOString()
-                });
-            }
-        });
-        
-        if (folders.length === 0 && files.length === 0) {
-            listEl.innerHTML = `
-                <div class="empty-state">
-                    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
-                    </svg>
-                    <p>No objects found</p>
-                </div>
-            `;
-            return;
-        }
-        
-        let html = '<div style="display: flex; flex-direction: column; gap: 0.5rem;">';
-        
-        // Show folders first
-        folders.forEach(folder => {
-            const folderName = folder.replace(prefix, '').replace('/', '');
-            html += `
-                <div class="credential-card" onclick="loadBucketObjects('${folder}')" style="cursor: pointer;">
-                    <div class="credential-info">
-                        <div style="display: flex; align-items: center; gap: 0.5rem;">
-                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" style="color: var(--primary-color);">
-                                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
-                            </svg>
-                            <h4 style="margin: 0;">${folderName}/</h4>
-                        </div>
-                        <div class="credential-meta">
-                            <span>Folder</span>
-                        </div>
-                    </div>
-                </div>
-            `;
-        });
-        
-        // Show files
-        files.forEach(file => {
-            const fileName = file.key.replace(prefix, '');
-            const fileSize = formatBytes(parseInt(file.size));
-            const fileDate = new Date(file.modified).toLocaleString();
-            
-            html += `
-                <div class="credential-card">
-                    <div class="credential-info">
-                        <div style="display: flex; align-items: center; gap: 0.5rem;">
-                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" style="color: var(--text-secondary);">
-                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
-                                <polyline points="14 2 14 8 20 8"></polyline>
-                                <line x1="16" y1="13" x2="8" y2="13"></line>
-                                <line x1="16" y1="17" x2="8" y2="17"></line>
-                                <polyline points="10 9 9 9 8 9"></polyline>
-                            </svg>
-                            <h4 style="margin: 0;">${fileName}</h4>
-                        </div>
-                        <div class="credential-meta">
-                            <span>${fileSize}</span> • <span>${fileDate}</span>
-                        </div>
-                    </div>
-                    <div class="credential-actions">
-                        <button class="btn-icon" onclick="downloadObject('${file.key}')" title="Download">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-                                <polyline points="7 10 12 15 17 10"></polyline>
-                                <line x1="12" y1="15" x2="12" y2="3"></line>
-                            </svg>
-                        </button>
-                        <button class="btn-icon btn-danger" onclick="deleteObject('${file.key}')" title="Delete">
-                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                                <polyline points="3 6 5 6 21 6"></polyline>
-                                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
-                            </svg>
-                        </button>
-                    </div>
-                </div>
-            `;
-        });
-        
-        html += '</div>';
-        listEl.innerHTML = html;
-        
-    } catch (error) {
-        listEl.innerHTML = `
-            <div class="empty-state">
-                <p style="color: var(--danger-color);">Failed to load objects</p>
-                <p style="font-size: 0.875rem; margin-top: 0.5rem;">${error.message}</p>
-            </div>
-        `;
-    }
-}
-
-function formatBytes(bytes) {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
-}
-
-async function downloadObject(key) {
-    try {
-        window.location.href = `${CONFIG.gatewayUrl}/s3/${state.currentBucket}/${key}`;
-        showToast('Download started', 'success');
-    } catch (error) {
-        showToast('Failed to download: ' + error.message, 'error');
-    }
-}
-
-async function deleteObject(key) {
-    const fileName = key.split('/').pop();
-    
-    if (!confirm(`Are you sure you want to delete "${fileName}"?`)) {
-        return;
-    }
-    
-    try {
-        const response = await fetch(`${CONFIG.gatewayUrl}/s3/${state.currentBucket}/${key}`, {
-            method: 'DELETE',
-            headers: {
-                'Authorization': `Bearer ${state.token}`
-            }
-        });
-        
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`Delete failed: ${response.statusText}`);
-        }
-        
-        showToast(`Object "${fileName}" deleted successfully`, 'success');
-        
-        // Reload bucket contents to reflect the deletion
-        await loadBucketObjects(state.currentPrefix || '');
-    } catch (error) {
-        console.error('Failed to delete object:', error);
-        showToast('Failed to delete object: ' + error.message, 'error');
-    }
-}
-
-function showUploadModal(bucketName) {
-    state.currentBucket = bucketName;
-    state.uploadPrefix = '';
-    document.getElementById('upload-bucket-name').textContent = bucketName;
-    document.getElementById('upload-file-input').value = '';
-    document.getElementById('upload-key-prefix').value = '';
-    showModal('upload-modal');
-}
-
-async function handleFileUpload() {
-    const fileInput = document.getElementById('upload-file-input');
-    const prefix = document.getElementById('upload-key-prefix').value;
-    
-    console.log('handleFileUpload called');
-    console.log('Current bucket:', state.currentBucket);
-    console.log('Current prefix:', state.currentPrefix);
-    
-    if (!fileInput.files || fileInput.files.length === 0) {
-        showToast('Please select a file to upload', 'error');
-        return;
-    }
-    
-    const file = fileInput.files[0];
-    const key = prefix ? `${prefix}/${file.name}` : file.name;
-    
-    console.log('Uploading file:', file.name);
-    console.log('File size:', file.size);
-    console.log('Key:', key);
-    console.log('Upload URL:', `${CONFIG.gatewayUrl}/s3/${state.currentBucket}/${key}`);
-    
-    try {
-        // Disable button during upload
-        const uploadBtn = document.getElementById('confirm-upload');
-        const originalText = uploadBtn.textContent;
-        uploadBtn.disabled = true;
-        uploadBtn.textContent = 'Uploading...';
-        
-        // Upload file directly as binary
-        const headers = {
-            'Authorization': `Bearer ${state.token}`,
-            'Content-Type': file.type || 'application/octet-stream'
-        };
-        
-        // Add credential header if a credential is selected
-        if (state.selectedCredential) {
-            headers['X-S3-Credential-AccessKey'] = state.selectedCredential;
-        }
-        
-        const response = await fetch(`${CONFIG.gatewayUrl}/s3/${state.currentBucket}/${key}`, {
-            method: 'PUT',
-            headers: headers,
-            body: file
-        });
-        
-        console.log('Upload response status:', response.status);
-        console.log('Upload response ok:', response.ok);
-        
-        if (!response.ok) {
-            const errorText = await response.text();
-            console.error('Upload failed with response:', errorText);
-            throw new Error(`Upload failed: ${response.statusText}`);
-        }
-        
-        console.log('Upload successful, closing upload modal');
-        
-        // Close only the upload modal, not all modals
-        document.getElementById('upload-modal').style.display = 'none';
-        document.getElementById('upload-modal').classList.remove('active');
-        
-        showToast(`File "${file.name}" uploaded successfully!`, 'success');
-        
-        console.log('Reloading bucket objects...');
-        console.log('Will reload bucket:', state.currentBucket, 'with prefix:', state.currentPrefix);
-        
-        // Reload bucket contents to show the new file
-        if (state.currentBucket) {
-            await loadBucketObjects(state.currentPrefix || '');
-            console.log('Bucket objects reloaded');
-        } else {
-            console.warn('No current bucket set, skipping reload');
-        }
-        
-        // Reset button
-        uploadBtn.disabled = false;
-        uploadBtn.textContent = originalText;
-        
-    } catch (error) {
-        console.error('Upload failed:', error);
-        showToast('Failed to upload file: ' + error.message, 'error');
-        
-        // Reset button
-        const uploadBtn = document.getElementById('confirm-upload');
-        uploadBtn.disabled = false;
-        uploadBtn.textContent = 'Upload';
-    }
-}
-
-// S3 Browser (Legacy - keeping for compatibility)
-async function handleListBucket() {
-    const bucket = document.getElementById('bucket-name').value;
-    if (!bucket) {
-        showToast('Please enter a bucket name', 'error');
-        return;
-    }
-    
-    state.currentBucket = bucket;
-    const listEl = document.getElementById('s3-objects-list');
-    listEl.innerHTML = '<div class="empty-state">Loading objects...</div>';
-    
-    try {
-        const response = await apiCall(`/s3/${bucket}${state.currentPrefix ? '?prefix=' + state.currentPrefix : ''}`);
-        
-        // Parse XML response (S3 returns XML)
-        const parser = new DOMParser();
-        const xml = parser.parseFromString(response, 'text/xml');
-        const contents = xml.getElementsByTagName('Contents');
-        
-        if (contents.length === 0) {
-            listEl.innerHTML = `
-                <div class="empty-state">
-                    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
-                    </svg>
-                    <p>No objects found</p>
-                </div>
-            `;
-        } else {
-            const items = Array.from(contents).map(item => {
-                const key = item.getElementsByTagName('Key')[0].textContent;
-                const size = item.getElementsByTagName('Size')[0].textContent;
-                const modified = item.getElementsByTagName('LastModified')[0].textContent;
-                
-                return { key, size, modified };
-            });
-            
-            listEl.innerHTML = items.map(item => `
-                <div class="object-item" onclick="selectObject('${item.key}')">
-                    <div class="object-info">
-                        <div class="object-icon">
-                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                                <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"></path>
-                                <polyline points="13 2 13 9 20 9"></polyline>
-                            </svg>
-                        </div>
-                        <div>
-                            <div>${item.key}</div>
-                            <div style="font-size: 0.875rem; color: var(--text-secondary);">
-                                ${formatBytes(item.size)} • ${new Date(item.modified).toLocaleString()}
-                            </div>
-                        </div>
-                    </div>
-                    <button class="btn-icon" onclick="downloadObject(event, '${item.key}')" title="Download">
-                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-                            <polyline points="7 10 12 15 17 10"></polyline>
-                            <line x1="12" y1="15" x2="12" y2="3"></line>
-                        </svg>
-                    </button>
-                </div>
-            `).join('');
-        }
-    } catch (error) {
-        listEl.innerHTML = `
-            <div class="empty-state">
-                <p style="color: var(--danger-color);">Failed to list objects</p>
-                <p style="font-size: 0.875rem; margin-top: 0.5rem;">${error.message}</p>
-            </div>
-        `;
-    }
-}
-
-function selectObject(key) {
-    console.log('Selected object:', key);
-    // Could implement preview or details view
-}
-
-async function downloadObject(event, key) {
-    event.stopPropagation();
-    
-    try {
-        const response = await fetch(`${CONFIG.gatewayUrl}/s3/${state.currentBucket}/${key}`, {
-            headers: {
-                'Authorization': `Bearer ${state.token}`
-            }
-        });
-        
-        const blob = await response.blob();
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = key.split('/').pop();
-        document.body.appendChild(a);
-        a.click();
-        window.URL.revokeObjectURL(url);
-        document.body.removeChild(a);
-        
-        showToast('Download started', 'success');
-    } catch (error) {
-        showToast('Failed to download: ' + error.message, 'error');
-    }
-}
-
-function handleUpload() {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.onchange = async (e) => {
-        const file = e.target.files[0];
-        if (!file) return;
-        
-        if (!state.currentBucket) {
-            showToast('Please select a bucket first', 'error');
-            return;
-        }
-        
-        try {
-            const formData = new FormData();
-            formData.append('file', file);
-            
-            await fetch(`${CONFIG.gatewayUrl}/s3/${state.currentBucket}/${file.name}`, {
-                method: 'PUT',
-                headers: {
-                    'Authorization': `Bearer ${state.token}`
-                },
-                body: file
-            });
-            
-            showToast('Upload successful!', 'success');
-            handleListBucket();
-        } catch (error) {
-            showToast('Upload failed: ' + error.message, 'error');
-        }
-    };
-    input.click();
-}
-
-// Policies
+// Policies Management
 // Policies Management
 async function loadPolicies() {
     const listEl = document.getElementById('policies-list');
@@ -1785,7 +1183,7 @@ async function loadPolicies() {
         let policies = response.policies || [];
         
         // Use simulated admin status for filtering
-        const isAdmin = state.actualIsAdmin && state.simulatedIsAdmin;
+        const isAdmin = state.actualIsAdmin;
         
         // Filter policies based on user role
         // Admin sees all policies, regular users see only their assigned policies
@@ -2011,27 +1409,54 @@ async function validatePolicyJSON() {
     }
 }
 
-// ===== ROLE MANAGEMENT =====
+// ===== GROUP MANAGEMENT =====
 
 async function loadRoles() {
     try {
         const response = await apiCall('/settings/roles');
-        const roles = response.roles || [];
+        const roles = response.groups || [];  // Backend returns "groups" key for backward compatibility
         
         const rolesList = document.getElementById('roles-list');
         
         if (roles.length === 0) {
-            rolesList.innerHTML = '<p style="text-align: center; color: var(--text-secondary); padding: 2rem;">No roles configured yet. Create one to map OIDC roles to policies.</p>';
+            rolesList.innerHTML = '<p style="text-align: center; color: var(--text-secondary); padding: 2rem;">No groups configured yet. Create one to map SCIM groups to policies.</p>';
             return;
         }
         
-        rolesList.innerHTML = roles.map(role => `
+        // Fetch SCIM groups to get displayName and id
+        let scimGroupsMap = {};
+        try {
+            const scimResponse = await apiCall('/settings/scim-groups');
+            const scimGroups = scimResponse.Resources || [];
+            // Map by SCIM group ID (not displayName) for accurate lookup
+            scimGroupsMap = scimGroups.reduce((map, group) => {
+                map[group.id] = {
+                    id: group.id,
+                    displayName: group.displayName
+                };
+                return map;
+            }, {});
+        } catch (error) {
+            console.error('Failed to load SCIM groups for display:', error);
+        }
+        
+        rolesList.innerHTML = roles.map(role => {
+            // Use role.scim_id directly (already provided by backend)
+            const scimInfo = role.scim_id ? scimGroupsMap[role.scim_id] : null;
+            const displayName = role.name;  // Backend already sets this to SCIM displayName
+            const scimId = role.scim_id || 'Unknown';
+            
+            return `
             <div class="credential-card">
                 <div class="credential-info">
-                    <h4>${escapeHtml(role.name)} ${getBackendStatusBadge(role.backend_status)}</h4>
-                    <div class="credential-meta">
-                        ${escapeHtml(role.description || 'No description')}
+                    <h4>
+                        ${escapeHtml(displayName)} 
+                        ${getBackendStatusBadge(role.backend_status)}
+                    </h4>
+                    <div class="credential-meta" style="font-size: 0.75rem; color: var(--text-secondary);">
+                        SCIM ID: ${escapeHtml(scimId)}
                     </div>
+                    ${role.description ? `<div class="credential-meta" style="margin-top: 0.25rem;">${escapeHtml(role.description)}</div>` : ''}
                     <div class="credential-meta" style="margin-top: 0.5rem;">
                         <strong>Policies:</strong>
                         ${role.policies && role.policies.length > 0 
@@ -2040,13 +1465,13 @@ async function loadRoles() {
                     </div>
                 </div>
                 <div class="credential-actions">
-                    <button class="btn-icon admin-only" onclick="editRole('${escapeHtml(role.name)}')" title="Edit Role">
+                    <button class="btn-icon admin-only" onclick="editRole('${escapeHtml(role.scim_id)}')" title="Edit Group">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
                             <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
                             <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
                         </svg>
                     </button>
-                    <button class="btn-icon btn-danger admin-only" onclick="deleteRole('${escapeHtml(role.name)}')" title="Delete Role">
+                    <button class="btn-icon btn-danger admin-only" onclick="deleteRole('${escapeHtml(role.scim_id)}')" title="Delete Group">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
                             <polyline points="3 6 5 6 21 6"></polyline>
                             <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
@@ -2054,13 +1479,13 @@ async function loadRoles() {
                     </button>
                 </div>
             </div>
-        `).join('');
+        `;
+        }).join('');
         
-        updateUIForAdminMode();
     } catch (error) {
         document.getElementById('roles-list').innerHTML = 
-            '<p style="text-align: center; color: var(--error-color); padding: 2rem;">Failed to load roles</p>';
-        showToast('Failed to load roles: ' + error.message, 'error');
+            '<p style="text-align: center; color: var(--error-color); padding: 2rem;">Failed to load groups</p>';
+        showToast('Failed to load groups: ' + error.message, 'error');
     }
 }
 
@@ -2080,51 +1505,85 @@ function getBackendStatusBadge(status) {
     return `<span class="status-badge ${config.class}" title="Backend status: ${status}">${config.text}</span>`;
 }
 
-async function showCreateRoleModal() {
-    const modal = document.getElementById('role-modal');
-    document.getElementById('role-modal-title').textContent = 'Create New Role';
-    document.getElementById('role-name').value = '';
-    document.getElementById('role-name').disabled = false;
-    document.getElementById('role-description').value = '';
+async function showCreateGroupModal() {
+    const modal = document.getElementById('group-modal');
+    document.getElementById('group-modal-title').textContent = 'Create New Role';
+    document.getElementById('group-name-select').value = '';
+    document.getElementById('group-description').value = '';
     
     state.editingRole = null;
+    state.roleSelectedPolicies = [];
+    
+    // Load available SCIM groups for selection
+    await loadAvailableSCIMGroups();
     
     // Load available policies for selection
-    await loadPoliciesForRoleModal();
+    await loadPoliciesForGroupModal();
     
     modal.style.display = 'flex';
 }
 
-async function editRole(name) {
+async function loadAvailableSCIMGroups() {
     try {
-        const response = await apiCall(`/settings/roles/${name}`);
-        const role = response.role;
+        // Get existing roles (SCIM groups with assigned policies) to filter them out
+        const rolesResponse = await apiCall('/settings/roles');
+        const existingScimIds = (rolesResponse.groups || []).map(r => r.scim_id).filter(id => id);
         
-        document.getElementById('role-modal-title').textContent = `Edit Role: ${name}`;
-        document.getElementById('role-name').value = role.name;
-        document.getElementById('role-name').disabled = true;
-        document.getElementById('role-description').value = role.description || '';
+        // Get SCIM groups
+        const groupsResponse = await apiCall('/settings/scim-groups');
+        const scimGroups = groupsResponse.Resources || [];
         
-        state.editingRole = name;
-        state.roleSelectedPolicies = role.policies || [];
+        // Filter out groups that already have policies (compare by SCIM ID)
+        const availableGroups = scimGroups.filter(g => !existingScimIds.includes(g.id));
         
-        // Load available policies and pre-select assigned ones
-        await loadPoliciesForRoleModal();
+        const select = document.getElementById('group-name-select');
+        select.innerHTML = '<option value="">-- Select a SCIM group --</option>';
         
-        document.getElementById('role-modal').style.display = 'flex';
+        if (availableGroups.length === 0) {
+            select.innerHTML += '<option value="" disabled>No available SCIM groups (all groups already configured)</option>';
+        } else {
+            availableGroups.forEach(group => {
+                select.innerHTML += `<option value="${escapeHtml(group.displayName)}">${escapeHtml(group.displayName)}</option>`;
+            });
+        }
     } catch (error) {
-        showToast('Failed to load role: ' + error.message, 'error');
+        console.error('Failed to load SCIM groups:', error);
+        const select = document.getElementById('group-name-select');
+        select.innerHTML = '<option value="">Failed to load SCIM groups</option>';
     }
 }
 
-async function loadPoliciesForRoleModal() {
+async function editRole(scimId) {
+    try {
+        const response = await apiCall(`/settings/roles/${scimId}`);
+        const role = response.group;
+        
+        document.getElementById('group-modal-title').textContent = `Edit Role: ${role.name}`;
+        document.getElementById('group-name-select').innerHTML = `<option value="${escapeHtml(role.name)}">${escapeHtml(role.name)}</option>`;
+        document.getElementById('group-name-select').value = role.name;
+        document.getElementById('group-name-select').disabled = true;
+        document.getElementById('group-description').value = role.description || '';
+        
+        state.editingRole = scimId;
+        state.roleSelectedPolicies = role.policies || [];
+        
+        // Load available policies and pre-select assigned ones
+        await loadPoliciesForGroupModal();
+        
+        document.getElementById('group-modal').style.display = 'flex';
+    } catch (error) {
+        showToast('Failed to load group: ' + error.message, 'error');
+    }
+}
+
+async function loadPoliciesForGroupModal() {
     try {
         const response = await apiCall('/settings/policies');
         const policies = response.policies || [];
         
         const selectedPolicies = state.roleSelectedPolicies || [];
         
-        const selector = document.getElementById('role-policies-selector');
+        const selector = document.getElementById('group-policies-selector');
         
         if (policies.length === 0) {
             selector.innerHTML = '<p style="color: var(--text-secondary); font-size: 0.875rem;">No policies available. Create policies first.</p>';
@@ -2171,44 +1630,62 @@ function toggleRolePolicy(policyName, isChecked) {
 }
 
 async function saveRole() {
-    const name = document.getElementById('role-name').value.trim();
-    const description = document.getElementById('role-description').value.trim();
+    const name = document.getElementById('group-name-select').value.trim();
+    const description = document.getElementById('group-description').value.trim();
     const policies = state.roleSelectedPolicies || [];
     
     if (!name) {
-        showToast('Please enter a role name', 'error');
-        return;
-    }
-    
-    // Validate role name format: only alphanumeric, dash, and underscore
-    const roleNameRegex = /^[a-zA-Z0-9_-]+$/;
-    if (!roleNameRegex.test(name)) {
-        showToast('Role name can only contain letters, numbers, dashes (-), and underscores (_)', 'error');
+        showToast('Please select a group name', 'error');
         return;
     }
     
     if (policies.length === 0) {
-        if (!confirm('This role has no policies assigned. Users with this role will have no permissions. Continue?')) {
-            return;
-        }
+        showToast('Please select at least one policy for this group', 'error');
+        return;
     }
     
     try {
         const isEdit = state.editingRole !== null;
         const method = isEdit ? 'PUT' : 'POST';
-        const endpoint = isEdit ? `/settings/roles/${name}` : '/settings/roles';
+        const endpoint = isEdit ? `/settings/roles/${state.editingRole}` : '/settings/roles';
         
-        await apiCall(endpoint, {
-            method,
-            body: JSON.stringify({
+        // For new roles, we need to find the SCIM group ID from the display name
+        let requestBody;
+        if (isEdit) {
+            // For edit, just send name, description, policies
+            requestBody = {
                 name,
                 description,
                 policies
-            })
+            };
+        } else {
+            // For create, look up the SCIM ID from the selected display name
+            const groupsResponse = await apiCall('/settings/scim-groups');
+            const scimGroups = groupsResponse.Resources || [];
+            const selectedGroup = scimGroups.find(g => g.displayName === name);
+            
+            if (!selectedGroup) {
+                showToast('Selected SCIM group not found', 'error');
+                return;
+            }
+            
+            requestBody = {
+                scim_group_id: selectedGroup.id,
+                description,
+                policies
+            };
+        }
+        
+        await apiCall(endpoint, {
+            method,
+            body: JSON.stringify(requestBody)
         });
         
+        // Re-enable the select in case it was disabled during edit
+        document.getElementById('group-name-select').disabled = false;
+        
         hideModals();
-        showToast(`Role ${isEdit ? 'updated' : 'created'} successfully!`, 'success');
+        showToast(`Group ${isEdit ? 'updated' : 'created'} successfully!`, 'success');
         loadRoles();
         
         // Update all credentials affected by this role change
@@ -2234,26 +1711,30 @@ async function saveRole() {
     }
 }
 
-async function deleteRole(name) {
-    if (!confirm(`Are you sure you want to delete role "${name}"?\n\nUsers with this role will lose their policy mappings.`)) {
+async function deleteRole(scimId) {
+    if (!confirm(`Are you sure you want to delete this group?\n\nCredentials with this group will lose their policy mappings.`)) {
         return;
     }
     
     try {
-        await apiCall(`/settings/roles/${name}`, { method: 'DELETE' });
-        showToast('Role deleted successfully', 'success');
+        await apiCall(`/settings/roles/${scimId}`, { method: 'DELETE' });
+        showToast('Group deleted successfully', 'success');
         loadRoles();
     } catch (error) {
-        showToast('Failed to delete role: ' + error.message, 'error');
+        showToast('Failed to delete group: ' + error.message, 'error');
     }
 }
 
-// Expose policy functions to global scope
+// Expose policy and group functions to global scope
 window.viewPolicy = viewPolicy;
 window.editPolicy = editPolicy;
 window.deletePolicy = deletePolicy;
 window.showCreatePolicyModal = showCreatePolicyModal;
 window.validatePolicyJSON = validatePolicyJSON;
+window.showCreateGroupModal = showCreateGroupModal;
+window.editRole = editRole;
+window.deleteRole = deleteRole;
+window.toggleRolePolicy = toggleRolePolicy;
 
 // Settings
 async function loadSettings() {
@@ -2357,5 +1838,3 @@ async function deleteUser(username) {
 // Expose functions to global scope for inline event handlers
 window.copyCredential = copyCredential;
 window.deleteCredential = deleteCredential;
-window.selectObject = selectObject;
-window.downloadObject = downloadObject;

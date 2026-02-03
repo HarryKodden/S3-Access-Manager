@@ -23,6 +23,12 @@ type PolicyStore interface {
 	GetPolicyNames() []string
 }
 
+// UserStore interface for accessing SCIM user data
+type UserStore interface {
+	IsUserActive(userName string) bool
+	GetUserGroups(userName string) []string
+}
+
 // sessionCacheEntry represents a cached user session
 type sessionCacheEntry struct {
 	userInfo  *UserInfo
@@ -32,13 +38,14 @@ type sessionCacheEntry struct {
 // Authenticator handles OIDC authentication
 type Authenticator struct {
 	userinfoURL     string
-	rolesClaim      string
+	groupsClaim     string
 	userClaim       string
 	emailClaim      string
 	sessionCacheTTL time.Duration
 	logger          *logrus.Logger
 	policyEngine    PolicyEngine
 	policyStore     PolicyStore
+	userStore       UserStore
 	adminUsers      []string
 	sessionCache    map[string]*sessionCacheEntry // token -> cached session
 	cacheMutex      sync.RWMutex
@@ -46,15 +53,16 @@ type Authenticator struct {
 
 // UserInfo contains authenticated user information
 type UserInfo struct {
-	Subject       string
-	Email         string
-	Roles         []string // Effective roles (includes all policies for admin users)
-	OriginalRoles []string // Original OIDC roles (before policy expansion)
-	Claims        map[string]interface{}
+	Subject        string
+	Email          string
+	Groups         []string // Effective groups (includes all policies for admin users)
+	OriginalGroups []string // Original OIDC groups (before policy expansion)
+	IsAdmin        bool     // True if user is an admin
+	Claims         map[string]interface{}
 }
 
 // NewOIDCAuthenticator creates a new OIDC authenticator
-func NewOIDCAuthenticator(cfg config.OIDCConfig, logger *logrus.Logger, policyEngine PolicyEngine, policyStore PolicyStore, adminUsers []string) (*Authenticator, error) {
+func NewOIDCAuthenticator(cfg config.OIDCConfig, logger *logrus.Logger, policyEngine PolicyEngine, policyStore PolicyStore, userStore UserStore, adminUsers []string) (*Authenticator, error) {
 	ctx := context.Background()
 
 	// Discover userinfo endpoint from OIDC discovery document
@@ -70,13 +78,14 @@ func NewOIDCAuthenticator(cfg config.OIDCConfig, logger *logrus.Logger, policyEn
 
 	return &Authenticator{
 		userinfoURL:     userinfoURL,
-		rolesClaim:      cfg.RolesClaim,
+		groupsClaim:     cfg.GroupsClaim,
 		userClaim:       cfg.UserClaim,
 		emailClaim:      cfg.EmailClaim,
 		sessionCacheTTL: cfg.SessionCacheTTL,
 		logger:          logger,
 		policyEngine:    policyEngine,
 		policyStore:     policyStore,
+		userStore:       userStore,
 		adminUsers:      adminUsers,
 		sessionCache:    make(map[string]*sessionCacheEntry),
 	}, nil
@@ -311,6 +320,7 @@ func (a *Authenticator) fetchUserInfo(ctx context.Context, accessToken string) (
 
 	a.logger.WithFields(logrus.Fields{
 		"claims_count": len(claims),
+		"claims":       claims, // Log all claims for debugging
 	}).Info("Successfully fetched userinfo claims")
 
 	return claims, nil
@@ -339,27 +349,51 @@ func (a *Authenticator) extractUserInfoFromClaims(claims map[string]interface{})
 		}
 	}
 
-	// Extract roles
-	userInfo.Roles = a.extractRoles(claims)
-	userInfo.OriginalRoles = make([]string, len(userInfo.Roles))
-	copy(userInfo.OriginalRoles, userInfo.Roles)
+	// Extract groups from OIDC claims (OIDC takes precedence)
+	oidcGroups := a.extractGroups(claims)
 
-	// For admin users, add all policy names from BOTH sources to their roles
+	// If OIDC provides groups, use them; otherwise fall back to SCIM
+	if len(oidcGroups) > 0 {
+		// OIDC claims take precedence
+		userInfo.Groups = oidcGroups
+		userInfo.OriginalGroups = make([]string, len(oidcGroups))
+		copy(userInfo.OriginalGroups, oidcGroups)
+	} else if a.userStore != nil {
+		// No OIDC groups, check SCIM as fallback
+		userName := userInfo.Email // Assume email is the userName
+		if a.userStore.IsUserActive(userName) {
+			// User exists and is active in SCIM, get groups from SCIM
+			userInfo.Groups = a.userStore.GetUserGroups(userName)
+			userInfo.OriginalGroups = make([]string, len(userInfo.Groups))
+			copy(userInfo.OriginalGroups, userInfo.Groups)
+		}
+	}
+
+	// If still no groups, ensure empty arrays are initialized
+	if userInfo.Groups == nil {
+		userInfo.Groups = []string{}
+	}
+	if userInfo.OriginalGroups == nil {
+		userInfo.OriginalGroups = []string{}
+	}
+
+	// For admin users, add all policy names from BOTH sources to their groups
 	if a.isAdminUser(userInfo.Subject, userInfo.Email) {
+		userInfo.IsAdmin = true
 		// Build a set to avoid duplicates
-		roleMap := make(map[string]bool)
-		for _, role := range userInfo.Roles {
-			roleMap[role] = true
+		groupMap := make(map[string]bool)
+		for _, group := range userInfo.Groups {
+			groupMap[group] = true
 		}
 
-		// Add policy engine policies (from policies/ directory)
+		// Add policy engine groups (from policies/ directory)
 		var enginePolicies []string
 		if a.policyEngine != nil {
 			enginePolicies = a.policyEngine.GetPolicyNames()
 			for _, policyName := range enginePolicies {
-				if !roleMap[policyName] {
-					userInfo.Roles = append(userInfo.Roles, policyName)
-					roleMap[policyName] = true
+				if !groupMap[policyName] {
+					userInfo.Groups = append(userInfo.Groups, policyName)
+					groupMap[policyName] = true
 				}
 			}
 		}
@@ -369,9 +403,9 @@ func (a *Authenticator) extractUserInfoFromClaims(claims map[string]interface{})
 		if a.policyStore != nil {
 			storePolicies = a.policyStore.GetPolicyNames()
 			for _, policyName := range storePolicies {
-				if !roleMap[policyName] {
-					userInfo.Roles = append(userInfo.Roles, policyName)
-					roleMap[policyName] = true
+				if !groupMap[policyName] {
+					userInfo.Groups = append(userInfo.Groups, policyName)
+					groupMap[policyName] = true
 				}
 			}
 		}
@@ -379,78 +413,95 @@ func (a *Authenticator) extractUserInfoFromClaims(claims map[string]interface{})
 		a.logger.WithFields(logrus.Fields{
 			"subject":         userInfo.Subject,
 			"email":           userInfo.Email,
-			"original_roles":  a.extractRoles(claims),
+			"original_groups": a.extractGroups(claims),
 			"engine_policies": enginePolicies,
 			"store_policies":  storePolicies,
-			"final_roles":     userInfo.Roles,
-		}).Info("Admin user - added all policy names from both sources to roles")
+			"final_groups":    userInfo.Groups,
+		}).Info("Admin user - added all policy names from both sources to groups")
 	}
 
 	a.logger.WithFields(logrus.Fields{
-		"subject":     userInfo.Subject,
-		"email":       userInfo.Email,
-		"roles":       userInfo.Roles,
-		"user_claim":  a.userClaim,
-		"email_claim": a.emailClaim,
-		"roles_claim": a.rolesClaim,
+		"subject":      userInfo.Subject,
+		"email":        userInfo.Email,
+		"groups":       userInfo.Groups,
+		"user_claim":   a.userClaim,
+		"email_claim":  a.emailClaim,
+		"groups_claim": a.groupsClaim,
 	}).Info("User info extracted from claims")
 
 	return userInfo
 }
 
-// extractRoles extracts roles from claims
-func (a *Authenticator) extractRoles(claims map[string]interface{}) []string {
-	roles := []string{}
+// extractGroups extracts groups from claims
+func (a *Authenticator) extractGroups(claims map[string]interface{}) []string {
+	groups := []string{}
 
-	// Try to get roles from the configured claim
-	if rolesValue, ok := claims[a.rolesClaim]; ok {
-		switch v := rolesValue.(type) {
+	a.logger.WithFields(logrus.Fields{
+		"groups_claim": a.groupsClaim,
+		"claims":       claims,
+	}).Debug("Extracting groups from claims")
+
+	// Try to get groups from the configured claim
+	if groupsValue, ok := claims[a.groupsClaim]; ok {
+		a.logger.WithFields(logrus.Fields{
+			"groups_claim": a.groupsClaim,
+			"groups_value": groupsValue,
+			"value_type":   fmt.Sprintf("%T", groupsValue),
+		}).Info("Found groups in configured claim")
+
+		switch v := groupsValue.(type) {
 		case []interface{}:
-			// Roles as array
-			for _, role := range v {
-				if roleStr, ok := role.(string); ok {
-					roles = append(roles, roleStr)
+			// Groups as array
+			for _, group := range v {
+				if groupStr, ok := group.(string); ok {
+					groups = append(groups, groupStr)
 				}
 			}
 		case []string:
-			// Roles as string array
-			roles = v
+			// Groups as string array
+			groups = v
 		case string:
-			// Single role as string
-			roles = append(roles, v)
+			// Single group as string
+			groups = append(groups, v)
 		}
 	}
 
-	// Fallback: try common role claim names
-	if len(roles) == 0 {
-		for _, claimName := range []string{"roles", "groups", "role", "group"} {
-			if rolesValue, ok := claims[claimName]; ok {
-				switch v := rolesValue.(type) {
+	// Fallback: try common group claim names
+	if len(groups) == 0 {
+		for _, claimName := range []string{"groups", "roles", "group", "role"} {
+			if groupsValue, ok := claims[claimName]; ok {
+				switch v := groupsValue.(type) {
 				case []interface{}:
-					for _, role := range v {
-						if roleStr, ok := role.(string); ok {
-							roles = append(roles, roleStr)
+					for _, group := range v {
+						if groupStr, ok := group.(string); ok {
+							groups = append(groups, groupStr)
 						}
 					}
 				case []string:
-					roles = v
+					groups = v
 				case string:
-					roles = append(roles, v)
+					groups = append(groups, v)
 				}
-				if len(roles) > 0 {
+				if len(groups) > 0 {
 					break
 				}
 			}
 		}
 	}
 
-	// If still no roles found, assign default admin role
-	if len(roles) == 0 {
-		roles = []string{"admin"}
-		a.logger.WithField("subject", claims["sub"]).Info("No roles found in token, assigning default admin role")
+	// Log the final result
+	a.logger.WithFields(logrus.Fields{
+		"groups_claim":     a.groupsClaim,
+		"extracted_groups": groups,
+		"groups_count":     len(groups),
+	}).Info("Groups extraction completed")
+
+	// If no groups found, user has no access
+	if len(groups) == 0 {
+		a.logger.WithField("subject", claims["sub"]).Warn("No groups found in token - user will have no access")
 	}
 
-	return roles
+	return groups
 }
 
 // isAdminUser checks if a user is an admin based on subject or email

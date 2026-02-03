@@ -22,7 +22,7 @@ oidc:
   scopes: "openid profile email eduPersonEntitlement"
 
   # The claim in the JWT that contains role names
-  roles_claim: "Roles"
+  groups_claim: "Groups"
 
   # Optional: Additional claims to extract for logging
   user_claim: "sub"
@@ -58,14 +58,6 @@ s3:
     access_key: ""
     secret_key: ""
 
-    # IAM endpoint (defaults to S3 endpoint if not specified)
-    # Set via IAM_ENDPOINT environment variable
-    endpoint: ""
-
-    # IAM region (defaults to S3 region if not specified)
-    # Set via IAM_REGION environment variable
-    region: ""
-
 policies:
   # Directory containing policy JSON files (synced to S3 backend)
   directory: "./policies"
@@ -77,9 +69,34 @@ policies:
   cache_enabled: true
   cache_ttl: 300s
 
+# Roles Configuration (backend API uses /settings/roles)
 roles:
-  # Directory for role definitions (maps OIDC roles to policies)
+  # Directory where role files are stored (SCIM Group -> Role -> IAM Group mapping)
   directory: "./data/roles"
+
+# SCIM Configuration
+users:
+  # Directory for SCIM user data
+  directory: "./data/Users"
+
+groups:
+  # Directory for SCIM group data (candidate groups for policy assignment)
+  directory: "./data/Groups"
+
+# Admin Configuration
+admin:
+  # Admin user's email/username (user with this identity gets admin privileges)
+  # RECOMMENDED: Set via ADMIN environment variable
+  # Example: "admin@example.com"
+  # Admin users can:
+  #   - Create/edit/delete policies
+  #   - Create/edit/delete roles
+  #   - View and manage all users
+  #   - Create credentials for any group
+  # Regular users can only:
+  #   - Create credentials for groups they belong to
+  #   - View their own credentials
+  username: ""
 
 logging:
   # Log level: debug, info, warn, error

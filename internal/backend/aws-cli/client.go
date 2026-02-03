@@ -22,6 +22,210 @@ type Client struct {
 	secretKey string
 }
 
+// UserInfo contains basic IAM user information
+type UserInfo struct {
+	Username   string
+	CreateDate string
+}
+
+// AttachedPolicy represents a managed policy attached to a user
+type AttachedPolicy struct {
+	PolicyArn  string `json:"PolicyArn"`
+	PolicyName string `json:"PolicyName"`
+}
+
+// AccessKey represents an access key for a user
+type AccessKey struct {
+	AccessKeyId string `json:"AccessKeyId"`
+	Status      string `json:"Status"`
+	CreateDate  string `json:"CreateDate"`
+}
+
+// CreateUserProfile creates an AWS profile for a user credential
+func (c *Client) CreateUserProfile(email, credentialName, accessKey, secretKey, sessionToken, region, endpoint string) error {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("failed to get home directory: %w", err)
+	}
+
+	awsDir := filepath.Join(homeDir, ".aws")
+	if err := os.MkdirAll(awsDir, 0700); err != nil {
+		return fmt.Errorf("failed to create .aws directory: %w", err)
+	}
+
+	// Create profile name: <email>-<credential-name>
+	emailPrefix := strings.Split(email, "@")[0] // Use email prefix to avoid @ in profile name
+	sanitizedCredName := strings.ToLower(strings.ReplaceAll(credentialName, " ", "-"))
+	sanitizedCredName = strings.ReplaceAll(sanitizedCredName, "_", "-")
+	// Remove any other invalid characters
+	for _, char := range []string{".", ",", "!", "@", "#", "$", "%", "^", "&", "*", "(", ")", "+", "=", "[", "]", "{", "}", "|", "\\", ":", ";", "\"", "'", "<", ">", "?", "/"} {
+		sanitizedCredName = strings.ReplaceAll(sanitizedCredName, char, "")
+	}
+	profileName := fmt.Sprintf("%s-%s", emailPrefix, sanitizedCredName)
+
+	// Read existing config file or create new one
+	configPath := filepath.Join(awsDir, "config")
+	configContent, err := os.ReadFile(configPath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read AWS config: %w", err)
+	}
+
+	// Check if profile already exists
+	existingConfig := string(configContent)
+	if strings.Contains(existingConfig, fmt.Sprintf("[profile %s]", profileName)) {
+		c.logger.WithField("profile", profileName).Info("AWS profile already exists, skipping creation")
+		return nil
+	}
+
+	// Append new profile to config
+	newProfileConfig := fmt.Sprintf(`
+[profile %s]
+region = %s
+endpoint_url = %s
+signature_version = s3v4
+payload_signing_enabled = true
+addressing_style = path
+`, profileName, region, endpoint)
+
+	newConfigContent := existingConfig + newProfileConfig
+	if err := os.WriteFile(configPath, []byte(newConfigContent), 0600); err != nil {
+		return fmt.Errorf("failed to write AWS config: %w", err)
+	}
+
+	// Read existing credentials file or create new one
+	credPath := filepath.Join(awsDir, "credentials")
+	credContent, err := os.ReadFile(credPath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read AWS credentials: %w", err)
+	}
+
+	// Check if credentials already exist
+	existingCred := string(credContent)
+	if strings.Contains(existingCred, fmt.Sprintf("[%s]", profileName)) {
+		c.logger.WithField("profile", profileName).Info("AWS credentials already exist, skipping creation")
+		return nil
+	}
+
+	// Append new credentials
+	var newCredContent string
+	if sessionToken != "" {
+		newCredContent = fmt.Sprintf(`
+[%s]
+aws_access_key_id = %s
+aws_secret_access_key = %s
+aws_session_token = %s
+`, profileName, accessKey, secretKey, sessionToken)
+	} else {
+		newCredContent = fmt.Sprintf(`
+[%s]
+aws_access_key_id = %s
+aws_secret_access_key = %s
+`, profileName, accessKey, secretKey)
+	}
+
+	newCredFileContent := existingCred + newCredContent
+	if err := os.WriteFile(credPath, []byte(newCredFileContent), 0600); err != nil {
+		return fmt.Errorf("failed to write AWS credentials: %w", err)
+	}
+
+	c.logger.WithFields(logrus.Fields{
+		"profile":     profileName,
+		"email":       email,
+		"credential":  credentialName,
+		"config_path": configPath,
+		"cred_path":   credPath,
+	}).Info("AWS user profile created")
+
+	return nil
+}
+
+// RemoveUserProfile removes an AWS profile for a user credential
+func (c *Client) RemoveUserProfile(email, credentialName string) error {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("failed to get home directory: %w", err)
+	}
+
+	awsDir := filepath.Join(homeDir, ".aws")
+
+	// Create profile name: <email>-<credential-name>
+	emailPrefix := strings.Split(email, "@")[0] // Use email prefix to avoid @ in profile name
+	sanitizedCredName := strings.ToLower(strings.ReplaceAll(credentialName, " ", "-"))
+	sanitizedCredName = strings.ReplaceAll(sanitizedCredName, "_", "-")
+	// Remove any other invalid characters
+	for _, char := range []string{".", ",", "!", "@", "#", "$", "%", "^", "&", "*", "(", ")", "+", "=", "[", "]", "{", "}", "|", "\\", ":", ";", "\"", "'", "<", ">", "?", "/"} {
+		sanitizedCredName = strings.ReplaceAll(sanitizedCredName, char, "")
+	}
+	profileName := fmt.Sprintf("%s-%s", emailPrefix, sanitizedCredName)
+
+	// Remove from config file
+	configPath := filepath.Join(awsDir, "config")
+	if err := c.removeProfileFromFile(configPath, profileName); err != nil {
+		c.logger.WithError(err).WithField("profile", profileName).Warn("Failed to remove profile from config")
+	}
+
+	// Remove from credentials file
+	credPath := filepath.Join(awsDir, "credentials")
+	if err := c.removeProfileFromFile(credPath, profileName); err != nil {
+		c.logger.WithError(err).WithField("profile", profileName).Warn("Failed to remove profile from credentials")
+	}
+
+	c.logger.WithFields(logrus.Fields{
+		"profile":    profileName,
+		"email":      email,
+		"credential": credentialName,
+	}).Info("AWS user profile removed")
+
+	return nil
+}
+
+// removeProfileFromFile removes a profile section from an AWS config/credentials file
+func (c *Client) removeProfileFromFile(filePath, profileName string) error {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil // File doesn't exist, nothing to remove
+		}
+		return fmt.Errorf("failed to read file: %w", err)
+	}
+
+	lines := strings.Split(string(content), "\n")
+	var newLines []string
+	inProfileSection := false
+
+	for _, line := range lines {
+		// Check if we're entering the profile section
+		if strings.HasPrefix(line, fmt.Sprintf("[%s]", profileName)) || strings.HasPrefix(line, fmt.Sprintf("[profile %s]", profileName)) {
+			inProfileSection = true
+			continue // Skip this line
+		}
+
+		// If we're in a profile section, skip lines until we find the next section
+		if inProfileSection {
+			// Check if this is the start of a new section (starts with [)
+			if strings.HasPrefix(line, "[") {
+				inProfileSection = false
+			} else {
+				continue // Skip lines in the profile section
+			}
+		}
+
+		// Keep non-profile lines
+		newLines = append(newLines, line)
+	}
+
+	// Write back the cleaned content
+	newContent := strings.Join(newLines, "\n")
+	// Remove any trailing empty lines
+	newContent = strings.TrimRight(newContent, "\n") + "\n"
+
+	if err := os.WriteFile(filePath, []byte(newContent), 0600); err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+
+	return nil
+}
+
 // NewClient creates a new AWS CLI client and sets up AWS config files
 func NewClient(endpoint, accessKey, secretKey, region string, logger *logrus.Logger) (*Client, error) {
 	// Set up AWS config directory
@@ -165,6 +369,15 @@ func (c *Client) CreateCredential(email, credentialName string, policyDoc map[st
 		return backend.CredentialInfo{}, fmt.Errorf("failed to ensure user exists: %w", err)
 	}
 
+	// Check current access key count (AWS limit: 2 per user)
+	keyCount, err := c.getUserAccessKeyCount(email)
+	if err != nil {
+		return backend.CredentialInfo{}, fmt.Errorf("failed to check access key count: %w", err)
+	}
+	if keyCount >= 2 {
+		return backend.CredentialInfo{}, fmt.Errorf("user already has maximum access keys (2). Delete an existing credential first")
+	}
+
 	// Create access key for the user
 	stdout, stderr, err := c.RunAwsCliCommand(
 		c.logger, "iam", "create-access-key",
@@ -232,6 +445,27 @@ func (c *Client) CreateCredential(email, credentialName string, policyDoc map[st
 			"policy_name": policyName,
 		},
 	}, nil
+}
+
+// getUserAccessKeyCount returns the number of access keys for a user
+func (c *Client) getUserAccessKeyCount(username string) (int, error) {
+	stdout, stderr, err := c.RunAwsCliCommand(
+		c.logger, "iam", "list-access-keys",
+		"--user-name", username,
+		"--output", "json",
+	)
+	if err != nil {
+		return 0, fmt.Errorf("failed to list access keys: %w (stderr: %s)", err, string(stderr))
+	}
+
+	var result struct {
+		AccessKeyMetadata []interface{} `json:"AccessKeyMetadata"`
+	}
+	if err := json.Unmarshal(stdout, &result); err != nil {
+		return 0, fmt.Errorf("failed to parse access keys: %w", err)
+	}
+
+	return len(result.AccessKeyMetadata), nil
 }
 
 // UpdateCredential updates an IAM user's policy
@@ -486,4 +720,156 @@ func (c *Client) DeleteUser(ctx context.Context, username string) error {
 
 	c.logger.WithField("username", username).Info("Deleted IAM user via CLI")
 	return nil
+}
+
+// GetUserInfo returns basic information about an IAM user
+func (c *Client) GetUserInfo(ctx context.Context, username string) (*UserInfo, error) {
+	stdout, stderr, err := c.RunAwsCliCommand(
+		c.logger, "iam", "get-user",
+		"--user-name", username,
+		"--output", "json")
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user info: %w (stderr: %s)", err, string(stderr))
+	}
+
+	var result struct {
+		User struct {
+			UserName   string `json:"UserName"`
+			CreateDate string `json:"CreateDate"`
+		} `json:"User"`
+	}
+
+	if err := json.Unmarshal(stdout, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse user info: %w", err)
+	}
+
+	return &UserInfo{
+		Username:   result.User.UserName,
+		CreateDate: result.User.CreateDate,
+	}, nil
+}
+
+// ListUserGroups returns the groups that a user belongs to
+func (c *Client) ListUserGroups(ctx context.Context, username string) ([]string, error) {
+	stdout, stderr, err := c.RunAwsCliCommand(
+		c.logger, "iam", "list-groups-for-user",
+		"--user-name", username,
+		"--output", "json")
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to list user groups: %w (stderr: %s)", err, string(stderr))
+	}
+
+	var result struct {
+		Groups []struct {
+			GroupName string `json:"GroupName"`
+		} `json:"Groups"`
+	}
+
+	if err := json.Unmarshal(stdout, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse user groups: %w", err)
+	}
+
+	groups := make([]string, 0, len(result.Groups))
+	for _, group := range result.Groups {
+		groups = append(groups, group.GroupName)
+	}
+
+	return groups, nil
+}
+
+// ListAttachedUserPolicies returns managed policies attached to a user
+func (c *Client) ListAttachedUserPolicies(ctx context.Context, username string) ([]AttachedPolicy, error) {
+	stdout, stderr, err := c.RunAwsCliCommand(
+		c.logger, "iam", "list-attached-user-policies",
+		"--user-name", username,
+		"--output", "json")
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to list attached user policies: %w (stderr: %s)", err, string(stderr))
+	}
+
+	var result struct {
+		AttachedPolicies []AttachedPolicy `json:"AttachedPolicies"`
+	}
+
+	if err := json.Unmarshal(stdout, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse attached user policies: %w", err)
+	}
+
+	return result.AttachedPolicies, nil
+}
+
+// ListUserPolicies returns inline policy names for a user
+func (c *Client) ListUserPolicies(ctx context.Context, username string) ([]string, error) {
+	stdout, stderr, err := c.RunAwsCliCommand(
+		c.logger, "iam", "list-user-policies",
+		"--user-name", username,
+		"--output", "json")
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to list user policies: %w (stderr: %s)", err, string(stderr))
+	}
+
+	var result struct {
+		PolicyNames []string `json:"PolicyNames"`
+	}
+
+	if err := json.Unmarshal(stdout, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse user policies: %w", err)
+	}
+
+	return result.PolicyNames, nil
+}
+
+// GetUserPolicy returns the policy document for an inline user policy
+func (c *Client) GetUserPolicy(ctx context.Context, username, policyName string) (string, error) {
+	stdout, stderr, err := c.RunAwsCliCommand(
+		c.logger, "iam", "get-user-policy",
+		"--user-name", username,
+		"--policy-name", policyName,
+		"--output", "json")
+
+	if err != nil {
+		return "", fmt.Errorf("failed to get user policy: %w (stderr: %s)", err, string(stderr))
+	}
+
+	var result struct {
+		PolicyDocument interface{} `json:"PolicyDocument"`
+	}
+
+	if err := json.Unmarshal(stdout, &result); err != nil {
+		return "", fmt.Errorf("failed to parse user policy: %w", err)
+	}
+
+	// Convert the PolicyDocument back to JSON string
+	policyJSON, err := json.Marshal(result.PolicyDocument)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal policy document: %w", err)
+	}
+
+	return string(policyJSON), nil
+}
+
+// ListAccessKeys returns access keys for a user
+func (c *Client) ListAccessKeys(ctx context.Context, username string) ([]AccessKey, error) {
+	stdout, stderr, err := c.RunAwsCliCommand(
+		c.logger, "iam", "list-access-keys",
+		"--user-name", username,
+		"--output", "json")
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to list access keys: %w (stderr: %s)", err, string(stderr))
+	}
+
+	var result struct {
+		AccessKeyMetadata []AccessKey `json:"AccessKeyMetadata"`
+	}
+
+	if err := json.Unmarshal(stdout, &result); err != nil {
+		return nil, fmt.Errorf("failed to parse access keys: %w", err)
+	}
+
+	return result.AccessKeyMetadata, nil
 }

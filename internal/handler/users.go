@@ -6,20 +6,23 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/harrykodden/s3-gateway/internal/auth"
 	"github.com/harrykodden/s3-gateway/internal/backend"
+	"github.com/harrykodden/s3-gateway/internal/store"
 	"github.com/sirupsen/logrus"
 )
 
 // UserHandler handles user management endpoints (admin only)
 type UserHandler struct {
 	userManager   backend.UserManager
+	userStore     *store.UserStore
 	adminUsername string
 	logger        *logrus.Logger
 }
 
 // NewUserHandler creates a new user handler
-func NewUserHandler(userManager backend.UserManager, adminUsername string, logger *logrus.Logger) *UserHandler {
+func NewUserHandler(userManager backend.UserManager, userStore *store.UserStore, adminUsername string, logger *logrus.Logger) *UserHandler {
 	return &UserHandler{
 		userManager:   userManager,
+		userStore:     userStore,
 		adminUsername: adminUsername,
 		logger:        logger,
 	}
@@ -55,10 +58,67 @@ func (h *UserHandler) ListUsers(c *gin.Context) {
 		return
 	}
 
+	// Check which users are SCIM-managed
+	userDetails := make([]gin.H, 0, len(users))
+	for _, username := range users {
+		_, isSCIM := h.userStore.GetUserByUserName(username)
+		userDetails = append(userDetails, gin.H{
+			"username": username,
+			"scim":     isSCIM,
+		})
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"users": users,
+		"users": userDetails,
 		"count": len(users),
 	})
+}
+
+// GetUserDetails returns detailed information about a specific user (admin only)
+func (h *UserHandler) GetUserDetails(c *gin.Context) {
+	userInfo := h.getUserInfo(c)
+	if userInfo == nil {
+		return
+	}
+
+	// Check if user is admin
+	if userInfo.Email != h.adminUsername {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Admin access required"})
+		return
+	}
+
+	if h.userManager == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "User management not available for this backend"})
+		return
+	}
+
+	username := c.Param("username")
+	if username == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Username is required"})
+		return
+	}
+
+	// Get detailed user information
+	details, err := h.userManager.GetUserDetails(c.Request.Context(), username)
+	if err != nil {
+		h.logger.WithError(err).WithField("username", username).Error("Failed to get user details")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to get user details"})
+		return
+	}
+
+	// Add SCIM details if available
+	if scimUser, exists := h.userStore.GetUserByUserName(username); exists {
+		details.ScimDetails = &backend.ScimUserDetails{
+			ID:          scimUser.ID,
+			DisplayName: scimUser.DisplayName,
+			Email:       scimUser.UserName, // SCIM username is email
+		}
+
+		// Get SCIM groups for this user
+		details.ScimDetails.Groups = h.userStore.GetUserGroups(username)
+	}
+
+	c.JSON(http.StatusOK, details)
 }
 
 // DeleteUser deletes a user and all their access keys (admin only)
@@ -88,6 +148,12 @@ func (h *UserHandler) DeleteUser(c *gin.Context) {
 	// Prevent admin from deleting themselves
 	if username == h.adminUsername {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot delete admin user"})
+		return
+	}
+
+	// Prevent deletion of SCIM-managed users
+	if _, exists := h.userStore.GetUserByUserName(username); exists {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot delete SCIM-managed user"})
 		return
 	}
 

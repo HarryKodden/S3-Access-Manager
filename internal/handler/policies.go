@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/harrykodden/s3-gateway/internal/auth"
 	"github.com/harrykodden/s3-gateway/internal/store"
+	"github.com/harrykodden/s3-gateway/internal/sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
@@ -12,8 +14,10 @@ import (
 
 // PolicyHandler handles policy management endpoints
 type PolicyHandler struct {
-	store  *store.PolicyStore
-	logger *logrus.Logger
+	store       *store.PolicyStore
+	groupStore  *store.GroupStore
+	syncService interface{}
+	logger      *logrus.Logger
 }
 
 // NewPolicyHandler creates a new policy handler
@@ -21,6 +25,16 @@ func NewPolicyHandler(policyStore *store.PolicyStore, logger *logrus.Logger) *Po
 	return &PolicyHandler{
 		store:  policyStore,
 		logger: logger,
+	}
+}
+
+// NewPolicyHandlerWithSync creates a new policy handler with sync capabilities
+func NewPolicyHandlerWithSync(policyStore *store.PolicyStore, groupStore *store.GroupStore, syncService interface{}, logger *logrus.Logger) *PolicyHandler {
+	return &PolicyHandler{
+		store:       policyStore,
+		groupStore:  groupStore,
+		syncService: syncService,
+		logger:      logger,
 	}
 }
 
@@ -177,6 +191,30 @@ func (h *PolicyHandler) UpdatePolicy(c *gin.Context) {
 		"policy_name": name,
 	}).Info("Policy updated")
 
+	// Sync affected groups - find all groups using this policy and update their IAM policies
+	if h.groupStore != nil && h.syncService != nil {
+		affectedGroups := h.groupStore.GetGroupsUsingPolicy(name)
+		if len(affectedGroups) > 0 {
+			h.logger.WithFields(logrus.Fields{
+				"policy":          name,
+				"affected_groups": len(affectedGroups),
+			}).Info("Syncing groups affected by policy update")
+
+			if syncSvc, ok := h.syncService.(*sync.SyncService); ok {
+				for _, group := range affectedGroups {
+					groupId := group.ScimGroupId
+					go func(gid string) {
+						if err := syncSvc.SyncGroupPolicy(context.Background(), gid); err != nil {
+							h.logger.WithError(err).WithField("group", gid).Error("Failed to sync group policy after policy update")
+						} else {
+							h.logger.WithField("group", gid).Info("Group policy synced after policy update")
+						}
+					}(groupId)
+				}
+			}
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"policy": PolicyResponse{
 			Name:        policy.Name,
@@ -268,8 +306,8 @@ func (h *PolicyHandler) isAdmin(c *gin.Context) bool {
 		return false
 	}
 
-	for _, role := range userInfo.Roles {
-		if role == "admin" {
+	for _, group := range userInfo.Groups {
+		if group == "admin" {
 			return true
 		}
 	}

@@ -452,6 +452,54 @@ body {
     gap: 1rem;
 }
 
+/* User Details Modal */
+.user-details-grid {
+    display: grid;
+    gap: 1.5rem;
+}
+
+.detail-section {
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 1rem;
+    background: var(--surface-hover);
+}
+
+.detail-section h4 {
+    margin: 0 0 1rem 0;
+    color: var(--primary-color);
+    font-size: 1rem;
+    font-weight: 600;
+}
+
+.detail-item {
+    margin-bottom: 0.75rem;
+    line-height: 1.4;
+}
+
+.detail-item:last-child {
+    margin-bottom: 0;
+}
+
+.detail-item strong {
+    color: var(--text-primary);
+}
+
+.detail-item small {
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+}
+
+.status-active {
+    color: var(--success-color);
+    font-weight: 500;
+}
+
+.status-inactive {
+    color: var(--danger-color);
+    font-weight: 500;
+}
+
 /* Toast Notification */
 .toast {
     position: fixed;

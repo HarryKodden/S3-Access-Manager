@@ -1,15 +1,17 @@
 package handler
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/harrykodden/s3-gateway/internal/auth"
 	"github.com/harrykodden/s3-gateway/internal/backend"
 	awscli "github.com/harrykodden/s3-gateway/internal/backend/aws-cli"
+	"github.com/harrykodden/s3-gateway/internal/config"
 	"github.com/harrykodden/s3-gateway/internal/s3client"
 	"github.com/harrykodden/s3-gateway/internal/store"
 
@@ -20,25 +22,29 @@ import (
 // CredentialHandler handles credential management endpoints
 type CredentialHandler struct {
 	store         *store.CredentialStore
-	roleStore     *store.RoleStore
+	groupStore    *store.GroupStore
+	userStore     *store.UserStore
 	policyStore   *store.PolicyStore
 	iamClient     *s3client.IAMClient
 	adminClient   backend.AdminClient
 	adminUsername string
-	roleManager   interface{} // RoleManager for backend operations
+	groupManager  interface{}     // GroupManager for backend operations
+	s3Config      config.S3Config // S3 configuration for profile creation
 	logger        *logrus.Logger
 }
 
 // NewCredentialHandler creates a new credential handler
-func NewCredentialHandler(credStore *store.CredentialStore, roleStore *store.RoleStore, policyStore *store.PolicyStore, iamClient *s3client.IAMClient, adminClient backend.AdminClient, adminUsername string, roleManager interface{}, logger *logrus.Logger) *CredentialHandler {
+func NewCredentialHandler(credStore *store.CredentialStore, groupStore *store.GroupStore, userStore *store.UserStore, policyStore *store.PolicyStore, iamClient *s3client.IAMClient, adminClient backend.AdminClient, adminUsername string, groupManager interface{}, s3Config config.S3Config, logger *logrus.Logger) *CredentialHandler {
 	return &CredentialHandler{
 		store:         credStore,
-		roleStore:     roleStore,
+		groupStore:    groupStore,
+		userStore:     userStore,
 		policyStore:   policyStore,
 		iamClient:     iamClient,
 		adminClient:   adminClient,
 		adminUsername: adminUsername,
-		roleManager:   roleManager,
+		groupManager:  groupManager,
+		s3Config:      s3Config,
 		logger:        logger,
 	}
 }
@@ -47,7 +53,7 @@ func NewCredentialHandler(credStore *store.CredentialStore, roleStore *store.Rol
 type CreateCredentialRequest struct {
 	Name        string   `json:"name" binding:"required"`
 	Description string   `json:"description"`
-	Roles       []string `json:"roles" binding:"required"`
+	Groups      []string `json:"groups" binding:"required"`
 }
 
 // CredentialResponse represents a credential in API responses
@@ -57,7 +63,7 @@ type CredentialResponse struct {
 	AccessKey     string   `json:"access_key"`
 	SecretKey     string   `json:"secret_key,omitempty"`    // Only included on creation
 	SessionToken  string   `json:"session_token,omitempty"` // Only included on creation for temporary credentials
-	Roles         []string `json:"roles,omitempty"`
+	Groups        []string `json:"groups,omitempty"`
 	CreatedAt     string   `json:"created_at"`
 	LastUsedAt    string   `json:"last_used_at,omitempty"`
 	Description   string   `json:"description,omitempty"`
@@ -111,6 +117,34 @@ func (h *CredentialHandler) ListCredentials(c *gin.Context) {
 		}
 	}
 
+	// Create a map of access keys that are already in the local store
+	localAccessKeys := make(map[string]bool)
+	for _, cred := range credentials {
+		localAccessKeys[cred.AccessKey] = true
+	}
+
+	// Add orphaned IAM access keys (exist in IAM but not in local store)
+	for _, keyInfo := range backendKeyMetadata {
+		if !localAccessKeys[keyInfo.AccessKeyId] {
+			h.logger.WithFields(logrus.Fields{
+				"username":   userInfo.Email,
+				"access_key": keyInfo.AccessKeyId,
+				"status":     keyInfo.Status,
+			}).Info("Found orphaned IAM access key not in local store")
+
+			responses = append(responses, CredentialResponse{
+				ID:            "",                                                  // No local ID for orphaned keys
+				Name:          fmt.Sprintf("orphaned-%s", keyInfo.AccessKeyId[:8]), // Generate a name
+				AccessKey:     keyInfo.AccessKeyId,
+				Groups:        []string{},         // Unknown groups for orphaned keys
+				CreatedAt:     keyInfo.CreateDate, // Already a formatted string
+				LastUsedAt:    "",                 // No last used date available for orphaned keys
+				Description:   "Orphaned IAM access key (created outside this interface)",
+				BackendStatus: keyInfo.Status,
+			})
+		}
+	}
+
 	for _, cred := range credentials {
 		status := "Unknown"
 
@@ -150,7 +184,7 @@ func (h *CredentialHandler) ListCredentials(c *gin.Context) {
 			ID:            cred.ID,
 			Name:          cred.Name,
 			AccessKey:     cred.AccessKey,
-			Roles:         cred.Roles,
+			Groups:        cred.Groups,
 			CreatedAt:     cred.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 			LastUsedAt:    formatTime(cred.LastUsedAt),
 			Description:   cred.Description,
@@ -161,7 +195,7 @@ func (h *CredentialHandler) ListCredentials(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"credentials": responses,
 		"count":       len(responses),
-		"user_roles":  userInfo.OriginalRoles,
+		"user_groups": userInfo.OriginalGroups,
 		"is_admin":    h.adminUsername != "" && userInfo.Email == h.adminUsername,
 		"user_info": gin.H{
 			"subject": userInfo.Subject,
@@ -187,15 +221,76 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 		return
 	}
 
+	// Validate credential name
+	if err := validateCredentialName(req.Name); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Check for duplicate credential names for this user
+	if h.store.CredentialExists(userInfo.Email, req.Name) {
+		c.JSON(http.StatusConflict, gin.H{"error": "A credential with this name already exists"})
+		return
+	}
+
 	h.logger.WithFields(logrus.Fields{
-		"email": userInfo.Email,
-		"roles": req.Roles,
+		"email":  userInfo.Email,
+		"groups": req.Groups,
 	}).Info("Credential creation request validated")
 
-	// Resolve roles to policies and get policy documents
-	policyNames := h.roleStore.GetPoliciesForRoles(req.Roles)
+	// Check if user is admin
+	isAdmin := userInfo.IsAdmin
+
+	// For non-admin users, validate that they can only create credentials for groups they are members of
+	if !isAdmin {
+		userGroups := userInfo.OriginalGroups
+		if len(userGroups) == 0 {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error": "You are not a member of any groups. Contact your administrator.",
+			})
+			return
+		}
+
+		// Check that all requested groups are in the user's group membership
+		for _, requestedGroup := range req.Groups {
+			found := false
+			for _, userGroup := range userGroups {
+				if requestedGroup == userGroup {
+					found = true
+					break
+				}
+			}
+			if !found {
+				h.logger.WithFields(logrus.Fields{
+					"user_email":      userInfo.Email,
+					"requested_group": requestedGroup,
+					"user_groups":     userGroups,
+				}).Warn("User attempted to create credential for group they don't belong to")
+				c.JSON(http.StatusForbidden, gin.H{
+					"error":         "You can only create credentials for groups you are a member of",
+					"your_groups":   userGroups,
+					"invalid_group": requestedGroup,
+				})
+				return
+			}
+		}
+
+		h.logger.WithFields(logrus.Fields{
+			"user_email":  userInfo.Email,
+			"user_groups": userGroups,
+			"req_groups":  req.Groups,
+		}).Info("User group membership validated for credential creation")
+	} else {
+		h.logger.WithFields(logrus.Fields{
+			"user_email": userInfo.Email,
+			"req_groups": req.Groups,
+		}).Info("Admin user - skipping group membership validation")
+	}
+
+	// Resolve groups to policies and get policy documents
+	policyNames := h.groupStore.GetPoliciesForGroups(req.Groups)
 	if len(policyNames) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "No policies found for the specified roles"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "No policies found for the specified groups"})
 		return
 	}
 
@@ -212,19 +307,19 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 	}
 
 	h.logger.WithFields(logrus.Fields{
-		"roles":        req.Roles,
+		"groups":       req.Groups,
 		"policy_names": policyNames,
 		"policy_count": len(policyDocuments),
-	}).Debug("Resolved roles to policy documents")
+	}).Debug("Resolved groups to policy documents")
 
 	// Check if user is admin - admins can assign any policies
 	if !h.isAdmin(userInfo) {
-		// Validate that requested policies are allowed by user's roles
-		userAllowedPolicies := h.roleStore.GetPoliciesForRoles(userInfo.Roles)
+		// Validate that requested policies are allowed by user's groups
+		userAllowedPolicies := h.groupStore.GetPoliciesForGroups(userInfo.Groups)
 		if !h.validatePolicies(policyNames, userAllowedPolicies) {
 			c.JSON(http.StatusForbidden, gin.H{
 				"error":            "Cannot assign policies beyond your privileges",
-				"your_roles":       userInfo.Roles,
+				"your_groups":      userInfo.Groups,
 				"allowed_policies": userAllowedPolicies,
 				"requested":        policyNames,
 			})
@@ -241,26 +336,39 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 
 	// Use backend admin client if configured
 	if h.adminClient != nil {
+		// Track what resources we've created for cleanup on failure
+		createdUser := false
+		createdAccessKey := false
+		accessKeyID := ""
+
 		// Create user in backend if needed
 		if err := h.adminClient.CreateUser(userInfo.Email, userInfo.Email); err != nil {
 			h.logger.WithError(err).WithField("email", userInfo.Email).Warn("Failed to ensure backend user exists")
 			// Continue anyway - user might already exist
+		} else {
+			createdUser = true
 		}
 
 		// Create credential with combined policy
 		credInfo, err := h.adminClient.CreateCredential(userInfo.Email, req.Name, combinedPolicy)
 		if err != nil {
 			h.logger.WithError(err).WithField("email", userInfo.Email).Error("Failed to create backend credential")
+			// Cleanup any partial resources
+			h.cleanupPartialCredential(c.Request.Context(), userInfo.Email, req.Name, createdUser, createdAccessKey, accessKeyID)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create credential"})
 			return
 		}
 
 		if credInfo.AccessKey == "" {
 			h.logger.WithField("backend", h.adminClient.GetBackendType()).Error("Backend CreateCredential returned empty access key")
+			// Cleanup any partial resources
+			h.cleanupPartialCredential(c.Request.Context(), userInfo.Email, req.Name, createdUser, createdAccessKey, accessKeyID)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create credential"})
 			return
 		}
 
+		accessKeyID = credInfo.AccessKey
+		createdAccessKey = true
 		accessKey = credInfo.AccessKey
 		secretKey = credInfo.SecretKey
 		sessionToken := credInfo.SessionToken
@@ -285,14 +393,11 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 
 		userID := userInfo.Email
 
-		cred, err := h.store.CreateWithKeys(userID, req.Name, req.Description, req.Roles, accessKey, secretKey, sessionToken, roleName, backendData)
+		cred, err := h.store.CreateWithKeys(userID, req.Name, req.Description, req.Groups, accessKey, secretKey, sessionToken, roleName, backendData)
 		if err != nil {
 			h.logger.WithError(err).Error("Failed to store credential")
-			// Try to clean up the backend credential
-			if backendData == nil {
-				backendData = make(map[string]interface{})
-			}
-			_ = h.adminClient.DeleteCredential(userInfo.Email, req.Name, backendData)
+			// Cleanup any partial resources
+			h.cleanupPartialCredential(c.Request.Context(), userInfo.Email, req.Name, createdUser, createdAccessKey, accessKeyID)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store credential"})
 			return
 		}
@@ -304,6 +409,22 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 			"access_key": accessKey,
 		}).Info("Credential created")
 
+		// Create AWS profile for the user credential
+		if awsCliClient, ok := h.adminClient.(*awscli.Client); ok {
+			if err := awsCliClient.CreateUserProfile(userInfo.Email, req.Name, accessKey, secretKey, sessionToken, h.s3Config.Region, h.s3Config.Endpoint); err != nil {
+				h.logger.WithError(err).WithFields(logrus.Fields{
+					"user_email": userInfo.Email,
+					"cred_name":  req.Name,
+				}).Warn("Failed to create AWS profile for user credential")
+				// Don't fail the credential creation if profile creation fails
+			} else {
+				h.logger.WithFields(logrus.Fields{
+					"user_email": userInfo.Email,
+					"cred_name":  req.Name,
+				}).Info("AWS profile created for user credential")
+			}
+		}
+
 		// Return credential with secret key (only shown once)
 		c.JSON(http.StatusCreated, gin.H{
 			"credential": CredentialResponse{
@@ -312,6 +433,7 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 				AccessKey:    cred.AccessKey,
 				SecretKey:    cred.SecretKey,
 				SessionToken: cred.SessionToken,
+				Groups:       cred.Groups,
 				CreatedAt:    cred.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 				Description:  cred.Description,
 			},
@@ -319,33 +441,64 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 		})
 		return
 	} else if h.iamClient != nil {
+		// Track what resources we've created for cleanup on failure
+		createdUser := false
+		createdAccessKey := false
+		accessKeyID := ""
+
 		// Use STS AssumeRole to create temporary credentials instead of permanent access keys
 		username := userInfo.Email
 
-		// Validate that roles are specified
-		if len(req.Roles) == 0 {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "At least one role must be specified for STS credentials"})
+		// Validate that groups are specified
+		if len(req.Groups) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "At least one group must be specified for STS credentials"})
 			return
 		}
 
-		// For multiple roles, we need to combine them. For single role, use existing role.
-		var roleName string
-		var roleArn string
-
-		if len(req.Roles) == 1 {
-			// Single role - use existing role directly
-			roleName = req.Roles[0]
-		} else {
-			// Multiple roles - create a deterministic combined role name based on sorted roles
-			// This allows reuse of the same combination across different credentials
-			sortedRoles := make([]string, len(req.Roles))
-			copy(sortedRoles, req.Roles)
-			sort.Strings(sortedRoles)
-
-			roleName = fmt.Sprintf("combined-%s", strings.Join(sortedRoles, "-"))
+		// For STS, we use the first group to create a role
+		if len(req.Groups) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "At least one group must be specified for STS credentials"})
+			return
 		}
 
-		// Get account ID for ARN construction
+		groupName := req.Groups[0] // Use first group for STS
+		roleName := fmt.Sprintf("sts-%s", groupName)
+
+		// Find SCIM group ID for this display name
+		var scimGroupId string
+		if scimGroup, exists := h.userStore.GetGroupByDisplayName(groupName); exists {
+			scimGroupId = scimGroup.ID
+		}
+
+		if scimGroupId == "" {
+			h.logger.WithField("group", groupName).Error("Group not found in SCIM")
+			c.JSON(http.StatusNotFound, gin.H{"error": "Group not found"})
+			return
+		}
+
+		// Get group policy
+		group, err := h.groupStore.Get(scimGroupId)
+		if err != nil {
+			h.logger.WithError(err).WithField("scimGroupId", scimGroupId).Error("Group not found in store")
+			c.JSON(http.StatusNotFound, gin.H{"error": "Group not found"})
+			return
+		}
+
+		combinedPolicy, err := h.combineGroupPolicies(group.Policies)
+		if err != nil {
+			h.logger.WithError(err).WithField("group", groupName).Error("Failed to combine group policies")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to combine group policies"})
+			return
+		}
+
+		// Create or update the STS role
+		if err := h.iamClient.CreateRole(c.Request.Context(), roleName, combinedPolicy); err != nil {
+			h.logger.WithError(err).WithField("role_name", roleName).Error("Failed to create STS role")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create STS role"})
+			return
+		}
+
+		// Construct role ARN
 		accountID, err := h.iamClient.GetAccountID(c.Request.Context())
 		if err != nil {
 			h.logger.WithError(err).WithField("username", username).Error("Failed to get account ID for role ARN")
@@ -353,48 +506,15 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 			return
 		}
 
-		// Construct role ARN
-		roleArn = fmt.Sprintf("arn:aws:iam::%s:role/%s", accountID, roleName)
-
-		// For combined roles, ensure the role exists with combined policy
-		if len(req.Roles) > 1 && h.roleManager != nil {
-			if rm, ok := h.roleManager.(*awscli.RoleManager); ok {
-				// Check if combined role exists
-				roles, err := rm.ListRoles(c.Request.Context())
-				if err != nil {
-					h.logger.WithError(err).Error("Failed to list roles")
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check existing roles"})
-					return
-				}
-
-				roleExists := false
-				for _, existingRole := range roles {
-					if existingRole == roleName {
-						roleExists = true
-						break
-					}
-				}
-
-				if !roleExists {
-					// Create the combined role
-					err = rm.CreateRole(c.Request.Context(), roleName, combinedPolicy)
-					if err != nil {
-						h.logger.WithError(err).WithField("role_name", roleName).Error("Failed to create combined role")
-						c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create combined role"})
-						return
-					}
-					h.logger.WithField("role_name", roleName).Info("Created combined role")
-				}
-			}
-		}
+		roleArn := fmt.Sprintf("arn:aws:iam::%s:role/%s", accountID, roleName)
 
 		// Assume the role to get temporary credentials
 		tempAccessKey, tempSecretKey, tempSessionToken, err := h.iamClient.AssumeRole(c.Request.Context(), roleArn, fmt.Sprintf("%s-session-%s", username, req.Name), 3600) // 1 hour duration
 		if err != nil {
 			h.logger.WithError(err).WithFields(logrus.Fields{
-				"username":  username,
-				"role_arn":  roleArn,
-				"role_name": roleName,
+				"username":   username,
+				"role_arn":   roleArn,
+				"group_name": groupName,
 			}).Error("Failed to assume role for temporary credentials")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create temporary credentials"})
 			return
@@ -403,6 +523,7 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 		accessKey = tempAccessKey
 		secretKey = tempSecretKey
 		sessionToken = tempSessionToken
+		accessKeyID = tempAccessKey
 
 		// For IAM, we don't have backend-specific data to store
 		credInfo = backend.CredentialInfo{
@@ -412,11 +533,11 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 		}
 
 		h.logger.WithFields(logrus.Fields{
-			"username":       username,
-			"role_arn":       roleArn,
-			"role_name":      roleName,
-			"selected_roles": req.Roles,
-			"access_key":     accessKey,
+			"username":        username,
+			"role_arn":        roleArn,
+			"group_name":      groupName,
+			"selected_groups": req.Groups,
+			"access_key":      accessKey,
 		}).Info("Temporary credentials created via STS AssumeRole")
 
 		// Store credential metadata locally
@@ -427,12 +548,11 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 
 		userID := userInfo.Email
 
-		cred, err := h.store.CreateWithKeys(userID, req.Name, req.Description, req.Roles, accessKey, secretKey, sessionToken, roleName, backendData)
+		cred, err := h.store.CreateWithKeys(userID, req.Name, req.Description, req.Groups, accessKey, secretKey, sessionToken, roleName, backendData)
 		if err != nil {
 			h.logger.WithError(err).Error("Failed to store credential")
-			// Try to clean up the backend credential
-			username := userInfo.Email
-			_ = h.iamClient.DeleteAccessKey(c.Request.Context(), username, accessKey)
+			// Cleanup any partial resources
+			h.cleanupPartialCredential(c.Request.Context(), userInfo.Email, req.Name, createdUser, createdAccessKey, accessKeyID)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store credential"})
 			return
 		}
@@ -461,9 +581,13 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 	} else {
 		// No backend configured - generate local keys only (for testing)
 		h.logger.Warn("No CEPH or IAM backend configured, generating local keys only")
-		cred, err := h.store.Create(userInfo.Email, req.Name, req.Description, req.Roles)
+		cred, err := h.store.Create(userInfo.Email, req.Name, req.Description, req.Groups)
 		if err != nil {
 			h.logger.WithError(err).Error("Failed to create credential")
+			// For local credentials, no backend cleanup needed, but remove from store if it was partially created
+			if err := h.store.DeleteCredential(req.Name); err != nil {
+				h.logger.WithError(err).WithField("credential", req.Name).Error("Failed to cleanup local credential during creation failure")
+			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create credential"})
 			return
 		}
@@ -474,7 +598,7 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 				Name:        cred.Name,
 				AccessKey:   cred.AccessKey,
 				SecretKey:   cred.SecretKey,
-				Roles:       cred.Roles,
+				Groups:      cred.Groups,
 				CreatedAt:   cred.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 				Description: cred.Description,
 			},
@@ -495,9 +619,39 @@ func (h *CredentialHandler) DeleteCredential(c *gin.Context) {
 		return
 	}
 
-	// Get credential before deleting to extract sub-user name
+	// First try to get credential from local store
 	cred, err := h.store.Get(accessKey)
 	if err != nil {
+		// If not found locally, check if it's an orphaned IAM credential
+		if h.iamClient != nil {
+			keyMetadata, err := h.iamClient.ListAccessKeyMetadata(c.Request.Context(), userInfo.Email)
+			if err == nil {
+				found := false
+				for _, keyInfo := range keyMetadata {
+					if keyInfo.AccessKeyId == accessKey {
+						found = true
+						break
+					}
+				}
+				if found {
+					// Delete orphaned credential directly from IAM
+					if err := h.iamClient.DeleteAccessKey(c.Request.Context(), userInfo.Email, accessKey); err != nil {
+						h.logger.WithError(err).WithFields(logrus.Fields{
+							"user_email": userInfo.Email,
+							"access_key": accessKey,
+						}).Error("Failed to delete orphaned IAM access key")
+						c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete orphaned credential"})
+						return
+					}
+					h.logger.WithFields(logrus.Fields{
+						"user_email": userInfo.Email,
+						"access_key": accessKey,
+					}).Info("Orphaned IAM access key deleted")
+					c.JSON(http.StatusOK, gin.H{"message": "Orphaned credential deleted successfully"})
+					return
+				}
+			}
+		}
 		c.JSON(http.StatusNotFound, gin.H{"error": "Credential not found"})
 		return
 	}
@@ -549,6 +703,22 @@ func (h *CredentialHandler) DeleteCredential(c *gin.Context) {
 		}
 	}
 
+	// Remove AWS profile for the user credential
+	if awsCliClient, ok := h.adminClient.(*awscli.Client); ok {
+		if err := awsCliClient.RemoveUserProfile(userInfo.Email, cred.Name); err != nil {
+			h.logger.WithError(err).WithFields(logrus.Fields{
+				"user_email": userInfo.Email,
+				"cred_name":  cred.Name,
+			}).Warn("Failed to remove AWS profile for user credential")
+			// Don't fail the credential deletion if profile removal fails
+		} else {
+			h.logger.WithFields(logrus.Fields{
+				"user_email": userInfo.Email,
+				"cred_name":  cred.Name,
+			}).Info("AWS profile removed for user credential")
+		}
+	}
+
 	// Delete credential from local store
 	if err := h.store.Delete(accessKey, userInfo.Subject); err != nil {
 		h.logger.WithError(err).Error("Failed to delete credential from store")
@@ -578,8 +748,33 @@ func (h *CredentialHandler) GetCredential(c *gin.Context) {
 		return
 	}
 
+	// First try to get from local store
 	cred, err := h.store.Get(accessKey)
 	if err != nil {
+		// If not found locally, check if it's an orphaned IAM credential
+		if h.iamClient != nil {
+			keyMetadata, err := h.iamClient.ListAccessKeyMetadata(c.Request.Context(), userInfo.Email)
+			if err == nil {
+				for _, keyInfo := range keyMetadata {
+					if keyInfo.AccessKeyId == accessKey {
+						// Found orphaned credential
+						c.JSON(http.StatusOK, gin.H{
+							"credential": CredentialResponse{
+								ID:            "", // No local ID
+								Name:          fmt.Sprintf("orphaned-%s", accessKey[:8]),
+								AccessKey:     accessKey,
+								Groups:        []string{}, // Unknown groups
+								CreatedAt:     keyInfo.CreateDate,
+								LastUsedAt:    "", // No last used date available
+								Description:   "Orphaned IAM access key (created outside this interface)",
+								BackendStatus: keyInfo.Status,
+							},
+						})
+						return
+					}
+				}
+			}
+		}
 		c.JSON(http.StatusNotFound, gin.H{"error": "Credential not found"})
 		return
 	}
@@ -596,7 +791,7 @@ func (h *CredentialHandler) GetCredential(c *gin.Context) {
 			Name:        cred.Name,
 			AccessKey:   cred.AccessKey,
 			SecretKey:   cred.SecretKey, // Include secret key for user's own credentials
-			Roles:       cred.Roles,
+			Groups:      cred.Groups,
 			CreatedAt:   cred.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
 			LastUsedAt:  formatTime(cred.LastUsedAt),
 			Description: cred.Description,
@@ -637,6 +832,26 @@ func (h *CredentialHandler) validatePolicies(requested, allowed []string) bool {
 	return true
 }
 
+// validateCredentialName validates credential name format and constraints
+func validateCredentialName(name string) error {
+	if len(name) == 0 {
+		return fmt.Errorf("credential name cannot be empty")
+	}
+	if len(name) > 64 {
+		return fmt.Errorf("credential name cannot exceed 64 characters")
+	}
+	if strings.Contains(name, " ") {
+		return fmt.Errorf("credential name cannot contain spaces")
+	}
+	// Allow alphanumeric, hyphens, and underscores
+	for _, r := range name {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_') {
+			return fmt.Errorf("credential name can only contain letters, numbers, hyphens, and underscores")
+		}
+	}
+	return nil
+}
+
 // formatTime formats a time or returns empty string if zero
 func formatTime(t time.Time) string {
 	if t.IsZero() {
@@ -673,10 +888,37 @@ func combinePolicies(policies []map[string]interface{}) map[string]interface{} {
 		}
 	}
 
+	// Deduplicate identical statements
+	uniqueStatements := deduplicateStatements(allStatements)
+
 	return map[string]interface{}{
 		"Version":   "2012-10-17",
-		"Statement": allStatements,
+		"Statement": uniqueStatements,
 	}
+}
+
+// deduplicateStatements removes duplicate policy statements
+func deduplicateStatements(statements []interface{}) []interface{} {
+	seen := make(map[string]bool)
+	var unique []interface{}
+
+	for _, stmt := range statements {
+		// Convert statement to JSON string for comparison
+		stmtJSON, err := json.Marshal(stmt)
+		if err != nil {
+			// If we can't marshal, include it anyway
+			unique = append(unique, stmt)
+			continue
+		}
+
+		stmtKey := string(stmtJSON)
+		if !seen[stmtKey] {
+			seen[stmtKey] = true
+			unique = append(unique, stmt)
+		}
+	}
+
+	return unique
 }
 
 // UpdateCredentials updates all existing credentials affected by policy/role changes
@@ -693,11 +935,11 @@ func (h *CredentialHandler) UpdateCredentials(c *gin.Context) {
 		return
 	}
 
-	// Get all existing roles
-	allRoles := h.roleStore.GetRoleNames()
-	roleSet := make(map[string]bool)
-	for _, role := range allRoles {
-		roleSet[role] = true
+	// Get all existing groups
+	allGroups := h.groupStore.GetGroupNames()
+	groupSet := make(map[string]bool)
+	for _, group := range allGroups {
+		groupSet[group] = true
 	}
 
 	// Get all credentials
@@ -717,57 +959,57 @@ func (h *CredentialHandler) UpdateCredentials(c *gin.Context) {
 	}
 
 	var updatedCount int
-	var roleUpdatedCount int
+	var groupUpdatedCount int
 	var errors []string
 
 	for _, cred := range allCredentials {
 		userID := cred.UserID
-		originalRoles := make([]string, len(cred.Roles))
-		copy(originalRoles, cred.Roles)
+		originalGroups := make([]string, len(cred.Groups))
+		copy(originalGroups, cred.Groups)
 
-		// Filter out roles that no longer exist
-		var validRoles []string
-		var removedRoles []string
-		for _, role := range cred.Roles {
-			if roleSet[role] {
-				validRoles = append(validRoles, role)
+		// Filter out groups that no longer exist
+		var validGroups []string
+		var removedGroups []string
+		for _, group := range cred.Groups {
+			if groupSet[group] {
+				validGroups = append(validGroups, group)
 			} else {
-				removedRoles = append(removedRoles, role)
+				removedGroups = append(removedGroups, group)
 			}
 		}
 
-		// If roles were removed, update the credential in the store
-		if len(removedRoles) > 0 {
+		// If groups were removed, update the credential in the store
+		if len(removedGroups) > 0 {
 			h.logger.WithFields(logrus.Fields{
 				"credential": cred.Name,
 				"user":       userID,
-				"removed":    removedRoles,
-				"remaining":  validRoles,
-			}).Info("Removing non-existent roles from credential")
+				"removed":    removedGroups,
+				"remaining":  validGroups,
+			}).Info("Removing non-existent groups from credential")
 
-			err := h.store.UpdateRoles(cred.AccessKey, validRoles)
+			err := h.store.UpdateGroups(cred.AccessKey, validGroups)
 			if err != nil {
 				h.logger.WithError(err).WithFields(logrus.Fields{
 					"credential": cred.Name,
 					"user":       userID,
-				}).Error("Failed to update credential roles in store")
-				errors = append(errors, fmt.Sprintf("Failed to update roles for credential %s: %v", cred.Name, err))
+				}).Error("Failed to update credential groups in store")
+				errors = append(errors, fmt.Sprintf("Failed to update groups for credential %s: %v", cred.Name, err))
 				continue
 			}
-			roleUpdatedCount++
+			groupUpdatedCount++
 
 			// Update the credential object for further processing
-			cred.Roles = validRoles
+			cred.Groups = validGroups
 		}
 
-		// Resolve roles to policies
-		policyNames := h.roleStore.GetPoliciesForRoles(cred.Roles)
+		// Resolve groups to policies
+		policyNames := h.groupStore.GetPoliciesForGroups(cred.Groups)
 		if len(policyNames) == 0 {
 			h.logger.WithFields(logrus.Fields{
 				"credential": cred.Name,
 				"user":       userID,
-				"roles":      cred.Roles,
-			}).Warn("No policies found for credential roles, skipping backend update")
+				"groups":     cred.Groups,
+			}).Warn("No policies found for credential groups, skipping backend update")
 			continue
 		}
 
@@ -833,25 +1075,26 @@ func (h *CredentialHandler) UpdateCredentials(c *gin.Context) {
 				}
 			}
 		} else if h.iamClient != nil && cred.SessionToken != "" {
-			// Update STS-based credential by updating the role policy
-			roleName := fmt.Sprintf("%s-%s-cred", userID, cred.Name)
-			if h.roleManager != nil {
-				if rm, ok := h.roleManager.(*awscli.RoleManager); ok {
-					err := rm.UpdateRole(c.Request.Context(), roleName, combinedPolicy)
+			// Update STS-based credential by updating the group policy
+			groupName := cred.Groups[0] // Assume first group for simplicity
+			if h.groupManager != nil {
+				if gm, ok := h.groupManager.(*awscli.GroupManager); ok {
+					policyName := fmt.Sprintf("%s-policy", groupName)
+					err := gm.PutGroupPolicy(c.Request.Context(), groupName, policyName, combinedPolicy)
 					if err != nil {
 						h.logger.WithError(err).WithFields(logrus.Fields{
 							"credential": cred.Name,
 							"user":       userID,
-							"role_name":  roleName,
-						}).Error("Failed to update STS role policy")
-						errors = append(errors, fmt.Sprintf("Failed to update STS role for credential %s: %v", cred.Name, err))
+							"group_name": groupName,
+						}).Error("Failed to update STS group policy")
+						errors = append(errors, fmt.Sprintf("Failed to update STS group for credential %s: %v", cred.Name, err))
 						continue
 					}
 					h.logger.WithFields(logrus.Fields{
 						"credential": cred.Name,
 						"user":       userID,
-						"role_name":  roleName,
-					}).Info("Updated STS role policy")
+						"group_name": groupName,
+					}).Info("Updated STS group policy")
 				}
 			}
 		}
@@ -865,10 +1108,10 @@ func (h *CredentialHandler) UpdateCredentials(c *gin.Context) {
 	}
 
 	response := gin.H{
-		"message":             "Credential update completed",
-		"total_count":         len(allCredentials),
-		"updated_count":       updatedCount,
-		"roles_updated_count": roleUpdatedCount,
+		"message":              "Credential update completed",
+		"total_count":          len(allCredentials),
+		"updated_count":        updatedCount,
+		"groups_updated_count": groupUpdatedCount,
 	}
 
 	if len(errors) > 0 {
@@ -884,12 +1127,72 @@ func (h *CredentialHandler) UpdateCredentials(c *gin.Context) {
 	c.JSON(status, response)
 }
 
-// isAdmin checks if the user has admin role
+// combineGroupPolicies combines policy documents from multiple policies into one
+func (h *CredentialHandler) combineGroupPolicies(policyNames []string) (map[string]interface{}, error) {
+	combinedStatements := []map[string]interface{}{}
+
+	for _, policyName := range policyNames {
+		policy, err := h.policyStore.Get(policyName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load policy %s: %w", policyName, err)
+		}
+
+		if statements, ok := policy.Policy["Statement"].([]interface{}); ok {
+			for _, stmt := range statements {
+				if stmtMap, ok := stmt.(map[string]interface{}); ok {
+					combinedStatements = append(combinedStatements, stmtMap)
+				}
+			}
+		}
+	}
+
+	combinedDoc := map[string]interface{}{
+		"Version":   "2012-10-17",
+		"Statement": combinedStatements,
+	}
+
+	return combinedDoc, nil
+}
+
+// isAdmin checks if the user has admin group
 func (h *CredentialHandler) isAdmin(userInfo *auth.UserInfo) bool {
-	for _, role := range userInfo.Roles {
-		if role == "admin" {
+	for _, group := range userInfo.Groups {
+		if group == "admin" {
 			return true
 		}
 	}
 	return false
+}
+
+// cleanupPartialCredential removes any partially created resources if credential creation fails
+func (h *CredentialHandler) cleanupPartialCredential(ctx context.Context, userName, credentialName string, createdUser bool, createdAccessKey bool, accessKeyID string) {
+	if createdAccessKey && accessKeyID != "" {
+		// Delete the access key if it was created
+		if h.adminClient != nil {
+			// For adminClient backend, we need to delete the credential
+			backendData := make(map[string]interface{})
+			if err := h.adminClient.DeleteCredential(userName, credentialName, backendData); err != nil {
+				h.logger.WithError(err).WithFields(logrus.Fields{
+					"user":       userName,
+					"credential": credentialName,
+				}).Error("Failed to cleanup access key during credential creation failure")
+			}
+		} else if h.iamClient != nil {
+			// For IAM client, delete the access key directly
+			if err := h.iamClient.DeleteAccessKey(ctx, userName, accessKeyID); err != nil {
+				h.logger.WithError(err).WithFields(logrus.Fields{
+					"user":        userName,
+					"accessKeyID": accessKeyID,
+				}).Error("Failed to cleanup access key during credential creation failure")
+			}
+		}
+	}
+
+	// Note: We don't delete the IAM user during cleanup as users are typically created once
+	// and shared across multiple credentials
+
+	// Remove the credential from store if it exists
+	if err := h.store.DeleteCredential(credentialName); err != nil {
+		h.logger.WithError(err).WithField("credential", credentialName).Error("Failed to cleanup credential from store during credential creation failure")
+	}
 }
