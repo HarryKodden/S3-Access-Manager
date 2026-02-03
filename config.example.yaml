@@ -22,7 +22,7 @@ oidc:
   scopes: "openid profile email eduPersonEntitlement"
 
   # The claim in the JWT that contains role names
-  groups_claim: "Groups"
+  groups_claim: "groups"
 
   # Optional: Additional claims to extract for logging
   user_claim: "sub"

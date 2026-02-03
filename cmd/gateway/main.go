@@ -337,140 +337,93 @@ func main() {
 	// 	// Web UI: Frontend must send X-S3-Credential-AccessKey header with selected credential
 	// 	// CLI: AWS CLI sends Authorization header with access key
 	// 	s3Routes.Any("/*proxyPath", s3Handler.ProxyRequest)
-	// }
+	// Root path handler - serves S3 operations (for CLI) or frontend (for web UI)
+	rootHandler := func(c *gin.Context) {
+		// Extract bucket and key from path
+		path := strings.TrimPrefix(c.Request.URL.Path, "/")
+		path = strings.TrimPrefix(path, "s3/")
+		parts := strings.SplitN(path, "/", 2)
+		bucket := parts[0]
 
-	// Catch-all route for S3 operations at root level (for AWS CLI compatibility)
-	// Temporarily disabled for debugging
-	/*
-		catchAllHandler := func(c *gin.Context) {
-			// Check if this is an S3 request (has Authorization header for CLI)
+		if bucket == "" {
+			// Root path - check if S3 list buckets request
 			authHeader := c.GetHeader("Authorization")
-			if authHeader != "" && strings.HasPrefix(authHeader, "AWS4-HMAC-SHA256") {
-				// This is an AWS CLI S3 request, handle with S3 middleware
+			credHeader := c.GetHeader("X-S3-Credential-AccessKey")
+			if (authHeader != "" && strings.HasPrefix(authHeader, "AWS4-HMAC-SHA256")) || credHeader != "" {
+				// S3 list buckets request
 				s3AuthMiddleware(c)
 				if c.IsAborted() {
-					return // Auth failed, response already sent
+					return // Auth failed
 				}
 				syncMiddleware(c)
 				if c.IsAborted() {
-					return // Sync failed, response already sent
+					return // Sync failed
 				}
-
-				// Extract bucket/key from path
-				path := strings.TrimPrefix(c.Request.URL.Path, "/")
-				if path == "" {
-					// Root path - list buckets
-					s3Handler.ListBuckets(c)
-				} else {
-					// Bucket/key operation - proxy to S3
-					parts := strings.SplitN(path, "/", 2)
-					bucket := parts[0]
-					key := ""
-					if len(parts) > 1 {
-						key = parts[1]
-					}
-
-					// Create user S3 client and proxy the request
-					userInfoValue, _ := c.Get("userInfo")
-					userInfo := userInfoValue.(*auth.UserInfo)
-					selectedCredValue, _ := c.Get("selectedCredential")
-					cred := selectedCredValue.(*store.Credential)
-
-					s3Client, err := s3Handler.CreateUserS3Client(c.Request.Context(), cred)
-					if err != nil {
-						c.Header("Content-Type", "application/xml")
-						c.XML(http.StatusInternalServerError, gin.H{
-							"Error": gin.H{
-								"Code":    "InternalError",
-								"Message": "Failed to create S3 client",
-							},
-						})
-						return
-					}
-
-					s3Handler.ProxyToS3(c, s3Client, bucket, key, userInfo)
-				}
+				s3Handler.ListBuckets(c)
 				return
 			}
-
-			// Not an S3 request, return 404
-			c.JSON(http.StatusNotFound, gin.H{"error": "Not found"})
-		}
-	*/
-
-	// Root path handler - serves S3 operations (for CLI) or frontend (for web UI)
-	rootHandler := func(c *gin.Context) {
-		// Check if this is an S3 request (has Authorization header for CLI or X-S3-Credential-AccessKey for web UI)
-		authHeader := c.GetHeader("Authorization")
-		credHeader := c.GetHeader("X-S3-Credential-AccessKey")
-
-		if (authHeader != "" && strings.HasPrefix(authHeader, "AWS4-HMAC-SHA256")) || credHeader != "" {
-			// This is an S3 request, handle with S3 middleware
-			s3AuthMiddleware(c)
-			if c.IsAborted() {
-				return // Auth failed, response already sent
-			}
-			syncMiddleware(c)
-			if c.IsAborted() {
-				return // Sync failed, response already sent
-			}
-
-			// Extract bucket and key from path
-			path := strings.TrimPrefix(c.Request.URL.Path, "/")
-			path = strings.TrimPrefix(path, "s3/")
-			parts := strings.SplitN(path, "/", 2)
-			bucket := parts[0]
-			key := ""
-			if len(parts) > 1 {
-				key = parts[1]
-			}
-			// Get user info and credential from context
-			userInfoValue, exists := c.Get("userInfo")
-			if !exists {
-				c.Header("Content-Type", "application/xml")
-				c.XML(http.StatusUnauthorized, gin.H{
-					"Error": gin.H{
-						"Code":    "AccessDenied",
-						"Message": "Unauthorized",
-					},
-				})
-				return
-			}
-			userInfo := userInfoValue.(*auth.UserInfo)
-
-			credValue, exists := c.Get("selectedCredential")
-			if !exists {
-				c.Header("Content-Type", "application/xml")
-				c.XML(http.StatusBadRequest, gin.H{
-					"Error": gin.H{
-						"Code":    "InvalidRequest",
-						"Message": "No credential available",
-					},
-				})
-				return
-			}
-			cred := credValue.(*store.Credential)
-
-			// Create S3 client for user
-			s3Client, err := s3Handler.CreateUserS3Client(c.Request.Context(), cred)
-			if err != nil {
-				c.Header("Content-Type", "application/xml")
-				c.XML(http.StatusInternalServerError, gin.H{
-					"Error": gin.H{
-						"Code":    "InternalError",
-						"Message": "Failed to create S3 client",
-					},
-				})
-				return
-			}
-
-			s3Handler.ProxyToS3(c, s3Client, bucket, key, userInfo)
+			// Not S3 request, serve frontend
+			c.File("./frontend/index.html")
 			return
 		}
 
-		fmt.Fprintf(os.Stderr, "Serving frontend HTML\n")
-		// Not an S3 request, serve frontend
-		c.File("./frontend/index.html")
+		// Bucket/key path, extract key
+		key := ""
+		if len(parts) > 1 {
+			key = parts[1]
+		}
+
+		// This is a bucket/key path, handle as S3 request (requires auth)
+		s3AuthMiddleware(c)
+		if c.IsAborted() {
+			return // Auth failed, response already sent
+		}
+		syncMiddleware(c)
+		if c.IsAborted() {
+			return // Sync failed, response already sent
+		}
+
+		// Get user info and credential from context
+		userInfoValue, exists := c.Get("userInfo")
+		if !exists {
+			c.Header("Content-Type", "application/xml")
+			c.XML(http.StatusUnauthorized, gin.H{
+				"Error": gin.H{
+					"Code":    "AccessDenied",
+					"Message": "Unauthorized",
+				},
+			})
+			return
+		}
+		userInfo := userInfoValue.(*auth.UserInfo)
+
+		credValue, exists := c.Get("selectedCredential")
+		if !exists {
+			c.Header("Content-Type", "application/xml")
+			c.XML(http.StatusBadRequest, gin.H{
+				"Error": gin.H{
+					"Code":    "InvalidRequest",
+					"Message": "No credential available",
+				},
+			})
+			return
+		}
+		cred := credValue.(*store.Credential)
+
+		// Create S3 client for user
+		s3Client, err := s3Handler.CreateUserS3Client(c.Request.Context(), cred)
+		if err != nil {
+			c.Header("Content-Type", "application/xml")
+			c.XML(http.StatusInternalServerError, gin.H{
+				"Error": gin.H{
+					"Code":    "InternalError",
+					"Message": "Failed to create S3 client",
+				},
+			})
+			return
+		}
+
+		s3Handler.ProxyToS3(c, s3Client, bucket, key, userInfo)
 	}
 	// Serve index.html for OIDC callback (frontend handles the callback in JavaScript)
 	router.GET("/callback", func(c *gin.Context) {

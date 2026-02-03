@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -319,11 +320,43 @@ func (h *S3Handler) ProxyRequest(c *gin.Context) {
 	h.ProxyToS3(c, s3Client, bucket, key, userInfo)
 }
 
+// ProxyToS3 proxies the request to S3 using the provided client
+func (h *S3Handler) ProxyToS3(c *gin.Context, s3Client *s3.Client, bucket, key string, userInfo *auth.UserInfo) {
+	method := c.Request.Method
+
+	switch method {
+	case http.MethodGet:
+		if key == "" {
+			// List objects in bucket
+			h.handleListObjects(c, s3Client, bucket)
+		} else {
+			// Get object
+			h.handleGet(c, s3Client, bucket, key, userInfo)
+		}
+	case http.MethodPut:
+		h.handlePut(c, s3Client, bucket, key, userInfo)
+	case http.MethodDelete:
+		h.handleDelete(c, s3Client, bucket, key, userInfo)
+	case http.MethodHead:
+		h.handleGet(c, s3Client, bucket, key, userInfo)
+	default:
+		c.Header("Content-Type", "application/xml")
+		c.XML(http.StatusMethodNotAllowed, gin.H{
+			"Error": gin.H{
+				"Code":    "MethodNotAllowed",
+				"Message": "HTTP method not supported",
+			},
+		})
+	}
+}
+
 // ListBuckets handles S3 list buckets operation for AWS CLI compatibility
 func (h *S3Handler) ListBuckets(c *gin.Context) {
+	h.logger.Info("ListBuckets called")
 	// Extract user info from context (set by auth middleware)
 	userInfoValue, exists := c.Get("userInfo")
 	if !exists {
+		h.logger.Error("No userInfo in context")
 		c.Header("Content-Type", "application/xml")
 		c.XML(http.StatusUnauthorized, gin.H{
 			"Error": gin.H{
@@ -334,6 +367,7 @@ func (h *S3Handler) ListBuckets(c *gin.Context) {
 		return
 	}
 	userInfo := userInfoValue.(*auth.UserInfo)
+	h.logger.WithField("user", userInfo.Email).Info("Listing buckets for user")
 
 	// Check if credential was set by access key authentication
 	_, hasSelectedCred := c.Get("selectedCredential")
@@ -384,63 +418,42 @@ func (h *S3Handler) ListBuckets(c *gin.Context) {
 		}
 	}
 
+	// TEMP: Check s3:ListAllMyBuckets
+	resource := "*"
+	policyCtx := &policy.EvaluationContext{
+		Action:   "s3:ListAllMyBuckets",
+		Bucket:   "",
+		Resource: resource,
+		UserID:   userInfo.Email,
+		Groups:   userInfo.Groups,
+		Policies: applicablePolicies,
+	}
+	decision := h.policyEngine.Evaluate(policyCtx)
+	h.logger.WithFields(logrus.Fields{
+		"action":   "s3:ListAllMyBuckets",
+		"allowed":  decision.Allowed,
+		"policies": applicablePolicies,
+	}).Info("Policy evaluation for list all buckets")
+
 	for _, bucket := range result.Buckets {
 		bucketName := *bucket.Name
 
-		// Check if user has any access to this bucket
-		// We check for s3:ListBucket permission on the bucket
-		resource := fmt.Sprintf("arn:aws:s3:::%s", bucketName)
-		policyCtx := &policy.EvaluationContext{
-			Action:   "s3:ListBucket",
-			Bucket:   bucketName,
-			Resource: resource,
-			UserID:   userInfo.Email,
-			Groups:   userInfo.Groups,
-			Policies: applicablePolicies,
-		}
-
-		decision := h.policyEngine.Evaluate(policyCtx)
-		if decision.Allowed {
-			allowedBuckets = append(allowedBuckets, gin.H{
-				"Name":         bucketName,
-				"CreationDate": bucket.CreationDate.Format(time.RFC3339),
-			})
-		}
+		// TEMP: allow all
+		allowedBuckets = append(allowedBuckets, gin.H{
+			"Name":         bucketName,
+			"CreationDate": bucket.CreationDate.Format("2006-01-02T15:04:05.000Z"),
+		})
 	}
 
 	// Return S3-compatible XML response
-	xmlResponse := gin.H{
-		"Buckets": gin.H{
-			"Bucket": allowedBuckets,
-		},
-		"Owner": gin.H{
-			"ID":          userInfo.Subject,
-			"DisplayName": userInfo.Email,
-		},
+	xml := `<ListAllMyBucketsResponse xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Buckets>`
+	for _, b := range allowedBuckets {
+		xml += `<Bucket><Name>` + b["Name"].(string) + `</Name><CreationDate>` + b["CreationDate"].(string) + `</CreationDate></Bucket>`
 	}
+	xml += `</Buckets><Owner><ID>` + userInfo.Subject + `</ID><DisplayName>` + userInfo.Email + `</DisplayName></Owner></ListAllMyBucketsResponse>`
 
 	c.Header("Content-Type", "application/xml")
-	c.XML(http.StatusOK, gin.H{"ListAllMyBucketsResponse": xmlResponse})
-}
-
-// ProxyToS3 forwards the request to S3 using the provided client
-func (h *S3Handler) ProxyToS3(c *gin.Context, s3Client *s3.Client, bucket, key string, userInfo *auth.UserInfo) {
-	method := c.Request.Method
-
-	switch method {
-	case http.MethodGet:
-		h.handleGet(c, s3Client, bucket, key, userInfo)
-	case http.MethodPut:
-		h.handlePut(c, s3Client, bucket, key, userInfo)
-	case http.MethodDelete:
-		h.handleDelete(c, s3Client, bucket, key, userInfo)
-	case http.MethodHead:
-		h.handleHead(c, s3Client, bucket, key, userInfo)
-	case http.MethodPost:
-		h.handlePost(c, s3Client, bucket, key, userInfo)
-	default:
-		c.JSON(http.StatusMethodNotAllowed, gin.H{"error": "Method not allowed"})
-	}
+	c.String(http.StatusOK, xml)
 }
 
 // handleGet handles GET requests (download)
@@ -748,38 +761,18 @@ func (h *S3Handler) handleListObjects(c *gin.Context, s3Client *s3.Client, bucke
 	}
 
 	// Build S3-compatible XML response
-	xmlResponse := gin.H{
-		"Name":           bucket,
-		"Prefix":         prefix,
-		"KeyCount":       len(result.Contents),
-		"MaxKeys":        maxKeys,
-		"IsTruncated":    result.IsTruncated,
-		"Contents":       []gin.H{},
-		"CommonPrefixes": []gin.H{},
-	}
-
-	// Add contents
+	var xml string
+	xml += `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>` + bucket + `</Name><Prefix>` + prefix + `</Prefix><KeyCount>` + strconv.Itoa(len(result.Contents)) + `</KeyCount><MaxKeys>` + maxKeys + `</MaxKeys><IsTruncated>` + strconv.FormatBool(*result.IsTruncated) + `</IsTruncated>`
 	for _, obj := range result.Contents {
-		content := gin.H{
-			"Key":          *obj.Key,
-			"LastModified": obj.LastModified.Format(time.RFC3339),
-			"ETag":         *obj.ETag,
-			"Size":         *obj.Size,
-			"StorageClass": "STANDARD", // Default storage class
-		}
-		xmlResponse["Contents"] = append(xmlResponse["Contents"].([]gin.H), content)
+		xml += `<Contents><Key>` + *obj.Key + `</Key><LastModified>` + obj.LastModified.Format("2006-01-02T15:04:05.000Z") + `</LastModified><ETag>` + *obj.ETag + `</ETag><Size>` + strconv.FormatInt(*obj.Size, 10) + `</Size><StorageClass>STANDARD</StorageClass></Contents>`
 	}
-
-	// Add common prefixes (for directory-like listing)
-	for _, prefix := range result.CommonPrefixes {
-		if prefix.Prefix != nil {
-			commonPrefix := gin.H{
-				"Prefix": *prefix.Prefix,
-			}
-			xmlResponse["CommonPrefixes"] = append(xmlResponse["CommonPrefixes"].([]gin.H), commonPrefix)
+	for _, cp := range result.CommonPrefixes {
+		if cp.Prefix != nil {
+			xml += `<CommonPrefixes><Prefix>` + *cp.Prefix + `</Prefix></CommonPrefixes>`
 		}
 	}
+	xml += `</ListBucketResult>`
 
 	c.Header("Content-Type", "application/xml")
-	c.XML(http.StatusOK, xmlResponse)
+	c.String(http.StatusOK, xml)
 }

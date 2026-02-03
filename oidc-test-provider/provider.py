@@ -29,7 +29,7 @@ JWT_SECRET = "test-jwt-secret-key-do-not-use-in-production"
 ISSUER = os.getenv('ISSUER', f"http://localhost:{PORT}")
 CLIENT_ID = os.getenv('CLIENT_ID', "test-client")
 CLIENT_SECRET = os.getenv('CLIENT_SECRET', "test-secret")
-ROLES_CLAIM = os.getenv('ROLES_CLAIM', 'eduPersonEntitlement')  # OIDC standard claim for group memberships
+ROLES_CLAIM = os.getenv('ROLES_CLAIM', 'groups')
 
 # Store authorization codes temporarily (in production, use Redis or similar)
 AUTH_CODES = {}
@@ -684,9 +684,16 @@ class OIDCHandler(BaseHTTPRequestHandler):
             return
         
         username = parts[2]
-        logger.info(f"Test token requested for user '{username}' from {client_ip}")
         
-        # Generate token with admin roles for testing
+        # Parse query parameters to get groups
+        parsed_path = urlparse(path)
+        params = parse_qs(parsed_path.query)
+        groups_param = params.get('groups', ['developer-group'])[0]  # Default to developer-group
+        groups = [g.strip() for g in groups_param.split(',')]  # Support comma-separated groups
+        
+        logger.info(f"Test token requested for user '{username}' with groups {groups} from {client_ip}")
+        
+        # Generate token with specified groups
         now = datetime.now(timezone.utc)
         payload = {
             "iss": ISSUER,
@@ -694,7 +701,7 @@ class OIDCHandler(BaseHTTPRequestHandler):
             "email": username,
             "exp": int((now + timedelta(hours=1)).timestamp()),
             "iat": int(now.timestamp()),
-            "eduPersonEntitlement": ["developer-group"]  # OIDC standard claim; use SCIM group IDs
+            "groups": groups  # OIDC standard claim; use SCIM group IDs
         }
         
         token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")

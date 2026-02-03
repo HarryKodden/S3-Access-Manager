@@ -30,32 +30,70 @@ Returns Prometheus metrics (request duration, count, size)
 
 ## S3 Proxy Endpoints
 
-All S3 operations via `/s3/{bucket}/{key...}` prefix.
+All S3 operations at root level: `/{bucket}/{key...}` (also supports legacy `/s3/{bucket}/{key...}` prefix)
+
+The gateway proxies S3 requests to the backend for both Web UI and AWS CLI:
+- **Web UI**: Uses OIDC token + X-S3-Credential-AccessKey header
+- **AWS CLI**: Uses AWS4-HMAC-SHA256 signature authentication
 
 ### Get Object
 ```http
-GET /s3/{bucket}/{key}
+GET /{bucket}/{key}
+
+# Web UI:
+Authorization: Bearer <oidc_token>
+X-S3-Credential-AccessKey: <selected_credential>
+
+# AWS CLI:
+Authorization: AWS4-HMAC-SHA256 Credential=...
 ```
 
 ### Put Object
 ```http
-PUT /s3/{bucket}/{key}
+PUT /{bucket}/{key}
 Content-Type: application/octet-stream
+
+# Web UI:
+Authorization: Bearer <oidc_token>
+X-S3-Credential-AccessKey: <selected_credential>
+
+# AWS CLI:
+Authorization: AWS4-HMAC-SHA256 Credential=...
 ```
 
 ### Delete Object
 ```http
-DELETE /s3/{bucket}/{key}
+DELETE /{bucket}/{key}
+
+# Web UI:
+Authorization: Bearer <oidc_token>
+X-S3-Credential-AccessKey: <selected_credential>
+
+# AWS CLI:
+Authorization: AWS4-HMAC-SHA256 Credential=...
 ```
 
 ### List Bucket
 ```http
-GET /s3/{bucket}?prefix=path/&delimiter=/
+GET /{bucket}?prefix=path/&delimiter=/
+
+# Web UI:
+Authorization: Bearer <oidc_token>
+X-S3-Credential-AccessKey: <selected_credential>
+
+# AWS CLI:
+Authorization: AWS4-HMAC-SHA256 Credential=...
 ```
 ```bash
+# Web UI example
 curl -H "Authorization: Bearer $TOKEN" \
-     http://localhost:9000/s3/my-bucket/files/document.pdf \
+     -H "X-S3-Credential-AccessKey: $ACCESS_KEY" \
+     http://localhost:9000/my-bucket/files/document.pdf \
      -o document.pdf
+
+# AWS CLI example (gateway proxies to S3 backend)
+aws s3 cp s3://my-bucket/files/document.pdf document.pdf \
+    --endpoint-url http://localhost:9000
 ```
 ## Credential Management Endpoints
 
@@ -163,34 +201,85 @@ DELETE /settings/buckets/{name}
 
 ## Example Usage
 
-### cURL
+### cURL (Web UI)
 ```bash
-TOKEN="your_access_token"
+TOKEN="your_oidc_access_token"
+CRED_KEY="your_credential_access_key"
 
-# List buckets
-curl -H "Authorization: Bearer $TOKEN" http://localhost/s3/my-bucket
+# List objects in bucket
+curl -H "Authorization: Bearer $TOKEN" \
+     -H "X-S3-Credential-AccessKey: $CRED_KEY" \
+     http://localhost:9000/my-bucket
 
 # Upload file
-curl -X PUT -H "Authorization: Bearer $TOKEN" \
-  --data-binary @file.txt http://localhost/s3/my-bucket/file.txt
+curl -X PUT \
+     -H "Authorization: Bearer $TOKEN" \
+     -H "X-S3-Credential-AccessKey: $CRED_KEY" \
+     --data-binary @file.txt \
+     http://localhost:9000/my-bucket/file.txt
 
 # Download file
 curl -H "Authorization: Bearer $TOKEN" \
-  http://localhost/s3/my-bucket/file.txt -o file.txt
+     -H "X-S3-Credential-AccessKey: $CRED_KEY" \
+     http://localhost:9000/my-bucket/file.txt -o file.txt
 ```
 
-### Python
+### AWS CLI (via Gateway)
+```bash
+# Configure AWS CLI with credentials created via gateway
+export AWS_ACCESS_KEY_ID="your_access_key"
+export AWS_SECRET_ACCESS_KEY="your_secret_key"
+
+# Point AWS CLI to gateway (gateway proxies to S3 backend)
+# List buckets
+aws s3 ls --endpoint-url http://localhost:9000
+
+# Upload file
+aws s3 cp file.txt s3://my-bucket/file.txt --endpoint-url http://localhost:9000
+
+# Download file
+aws s3 cp s3://my-bucket/file.txt file.txt --endpoint-url http://localhost:9000
+```
+
+### Python (Web UI)
 ```python
 import requests
 
-headers = {"Authorization": f"Bearer {token}"}
-base_url = "http://localhost"
+headers = {
+    "Authorization": f"Bearer {oidc_token}",
+    "X-S3-Credential-AccessKey": credential_access_key
+}
+base_url = "http://localhost:9000"
 
 # List objects
-r = requests.get(f"{base_url}/s3/bucket", headers=headers)
+r = requests.get(f"{base_url}/bucket", headers=headers)
 print(r.json())
 
 # Upload
 with open("file.txt", "rb") as f:
-    requests.put(f"{base_url}/s3/bucket/file.txt", headers=headers, data=f)
+    requests.put(f"{base_url}/bucket/file.txt", headers=headers, data=f)
+```
+
+### Python with boto3 (via Gateway)
+```python
+import boto3
+
+# Create S3 client pointing to gateway (gateway proxies to S3 backend)
+s3 = boto3.client(
+    's3',
+    endpoint_url='http://localhost:9000',
+    aws_access_key_id='your_access_key',
+    aws_secret_access_key='your_secret_key',
+    region_name='us-east-1'
+)
+
+# List buckets
+buckets = s3.list_buckets()
+print(buckets)
+
+# Upload file
+s3.upload_file('file.txt', 'bucket', 'file.txt')
+
+# Download file
+s3.download_file('bucket', 'file.txt', 'downloaded.txt')
 ```

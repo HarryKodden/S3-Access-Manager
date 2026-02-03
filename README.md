@@ -80,7 +80,7 @@ flowchart TB
     %% Client connections
     WebUI -->|"1. Login (OIDC)"| OIDC
     WebUI -->|"2. Manage credentials/buckets"| RBAC
-    AWSCLI -->|"Direct S3 ops (AWS Sig v4)"| AccessKey
+    AWSCLI -->|"S3 ops with<br/>created credentials<br/>(AWS Sig v4)"| S3API
 
     %% Auth flow
     OIDC -.->|"Validate token"| AuthProvider
@@ -103,9 +103,9 @@ flowchart TB
 
     %% Credential creation flow
     RBAC -->|"Create credential"| CredStore
-    CredStore -->|"Register IAM user"| IAM
+    CredStore -->|"Register IAM user + access keys"| IAM
 
-    %% S3 operations flow
+    %% S3 operations flow (via Gateway UI)
     RBAC -->|"Authorized request"| PolicyEngine
     PolicyEngine -->|"Enforce policies"| S3Handler
     S3Handler -->|"User S3 client"| S3Client
