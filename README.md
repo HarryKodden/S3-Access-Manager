@@ -15,7 +15,6 @@
 - 🔄 **Automatic SCIM Sync**: File watcher triggers IAM sync on SCIM data changes
 - 🔑 **Self-Service Credentials**: Users create S3 access keys with delegated policies
 - 🛡️ **Policy-Based Permissions**: Fine-grained access control with custom policies
-- 📊 **Dual Policy Sources**: Built-in + user-created policies
 - 🌐 **S3 Browser**: Visual file management with upload/download
 - 📈 **Prometheus Metrics**: Built-in monitoring endpoint
 - 🐳 **Docker Ready**: Complete containerization
@@ -26,105 +25,105 @@
 
 ```mermaid
 flowchart TB
-    subgraph Clients["👥 Clients"]
-        WebUI["🌐 Web UI<br/>(Browser)"]
-        AWSCLI["⚙️ AWS CLI<br/>(s3cmd, boto3)"]
+    %% Define styles
+    classDef clientClass fill:#e3f2fd,stroke:#1976d2,stroke-width:2px,color:#1976d2
+    classDef authClass fill:#fff3e0,stroke:#f57c00,stroke-width:2px,color:#e65100
+    classDef coreClass fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,color:#4a148c
+    classDef syncClass fill:#e8f5e9,stroke:#388e3c,stroke-width:2px,color:#1b5e20
+    classDef proxyClass fill:#fce4ec,stroke:#c2185b,stroke-width:2px,color:#880e4f
+    classDef backendClass fill:#fff9c4,stroke:#f9a825,stroke-width:2px,color:#f57f17
+    classDef oidcClass fill:#e1f5fe,stroke:#0277bd,stroke-width:2px,color:#01579b
+
+    %% Clients
+    subgraph "👥 Clients"
+        WebUI["🌐 Web UI<br/>Browser"]
+        AWSCLI["⚙️ AWS CLI<br/>s3cmd, boto3"]
     end
 
-    subgraph Gateway["🔐 S3 Access Manager Gateway"]
+    %% Gateway
+    subgraph "🔐 S3 Access Manager"
         direction TB
-        
-        subgraph Auth["Authentication Layer"]
-            OIDC["OIDC Auth<br/>(Session-based)"]
-            AccessKey["Access Key Auth<br/>(AWS Signature v4)"]
+
+        subgraph "🔑 Authentication"
+            OIDC["OIDC Auth<br/>Session-based"]
+            AccessKey["Access Key Auth<br/>AWS Sig v4"]
         end
-        
-        subgraph RBAC["Authorization Layer"]
-            AdminCheck["Admin Role Check<br/>(IsAdmin flag)"]
-            GroupCheck["Group Membership<br/>(OIDC Groups claim)"]
+
+        subgraph "🛡️ Authorization"
+            AdminCheck["Admin Check<br/>IsAdmin flag"]
+            GroupCheck["Group Validation<br/>OIDC Groups claim"]
         end
-        
-        subgraph Core["Core Services"]
-            PolicyEngine["Policy Engine<br/>(Validation & Enforcement)"]
-            CredStore["Credential Store<br/>(data/credentials.json)"]
-            PolicyStore["Policy Store<br/>(data/policies/)"]
-            RoleStore["Role Store<br/>(data/roles/)"]
+
+        subgraph "🏗️ Core Services"
+            PolicyEngine["Policy Engine<br/>Validation & Enforcement"]
+            CredStore["Credential Store<br/>data/credentials.json"]
+            PolicyStore["Policy Store<br/>data/policies/"]
+            RoleStore["Role Store<br/>data/roles/"]
         end
-        
-        subgraph Sync["Synchronization"]
-            FileWatcher["File Watcher<br/>(fsnotify)"]
-            SyncService["SCIM-to-IAM Sync<br/>(Auto + Manual)"]
+
+        subgraph "🔄 Synchronization"
+            FileWatcher["File Watcher<br/>fsnotify"]
+            SyncService["SCIM-to-IAM Sync<br/>Auto + Manual"]
         end
-        
-        subgraph Proxy["S3 Proxy"]
-            S3Handler["S3 Request Handler<br/>(Bucket/Object Ops)"]
-            S3Client["S3 Client<br/>(User credentials)"]
+
+        subgraph "🌐 S3 Proxy"
+            S3Handler["S3 Request Handler<br/>Bucket/Object Ops"]
+            S3Client["S3 Client<br/>User credentials"]
         end
     end
 
-    subgraph SCIM["👥 SCIM Identity Provider"]
-        SCIMServer["SCIM Server<br/>(User/Group provisioning)"]
-        SCIMData["SCIM Data Store"]
-        SCIMServer --> SCIMData
+    %% External Services
+    subgraph "👥 Identity"
+        SCIM["SCIM Server<br/>User/Group provisioning"]
+        SCIMData["SCIM Data<br/>JSON files"]
     end
 
-    subgraph Backend["☁️ S3 Backend (Ceph/MinIO/AWS)"]
-        S3API["S3 API<br/>(Bucket/Object operations)"]
-        IAM["IAM Service<br/>(User/Policy management)"]
+    subgraph "☁️ S3 Backend"
+        S3API["S3 API<br/>Bucket/Object ops"]
+        IAM["IAM Service<br/>User/Policy mgmt"]
     end
 
-    subgraph OIDC_Provider["🔑 OIDC Provider"]
-        AuthProvider["Auth0 / Okta / Keycloak<br/>(Authentication)"]
+    subgraph "🔐 OIDC Provider"
+        AuthProvider["Auth0 / Okta / Keycloak<br/>Authentication"]
     end
 
-    %% Client connections
-    WebUI -->|"1. Login (OIDC)"| OIDC
-    WebUI -->|"2. Manage credentials/buckets"| RBAC
-    AWSCLI -->|"S3 ops with<br/>created credentials<br/>(AWS Sig v4)"| S3API
+    %% Connections
+    WebUI -->|"1. OIDC Login"| OIDC
+    WebUI -->|"2. Management"| AdminCheck
+    AWSCLI -->|"S3 Operations"| AccessKey
 
-    %% Auth flow
-    OIDC -.->|"Validate token"| AuthProvider
-    OIDC -->|"Extract Groups claim"| GroupCheck
-    AccessKey -->|"Verify credentials"| CredStore
+    OIDC -->|"Validate Token"| AuthProvider
+    OIDC -->|"Extract Groups"| GroupCheck
+    AccessKey -->|"Verify Credentials"| CredStore
 
-    %% RBAC flow
-    AdminCheck -->|"Admin users"| PolicyStore
-    AdminCheck -->|"Admin users"| RoleStore
-    GroupCheck -->|"All users"| CredStore
+    AdminCheck -->|"Admin Users"| PolicyStore
+    AdminCheck -->|"Admin Users"| RoleStore
+    GroupCheck -->|"All Users"| CredStore
 
-    %% SCIM sync flow
-    SCIMData -->|"Users JSON files"| FileWatcher
-    SCIMData -->|"Groups JSON files"| FileWatcher
-    FileWatcher -->|"Trigger on file changes"| SyncService
-    SyncService -->|"Create/update IAM users"| IAM
-    SyncService -->|"Attach policies from roles"| IAM
-    RoleStore -.->|"Policy mappings"| SyncService
-    PolicyStore -.->|"Policy definitions"| SyncService
+    SCIM --> SCIMData
+    SCIMData -->|"File Changes"| FileWatcher
+    FileWatcher -->|"Trigger Sync"| SyncService
+    SyncService -->|"Create IAM Users"| IAM
+    SyncService -->|"Attach Policies"| IAM
+    RoleStore -.->|"Policy Mappings"| SyncService
+    PolicyStore -.->|"Policy Definitions"| SyncService
 
-    %% Credential creation flow
-    RBAC -->|"Create credential"| CredStore
-    CredStore -->|"Register IAM user + access keys"| IAM
+    AdminCheck -->|"Create Credential"| CredStore
+    CredStore -->|"Register in IAM"| IAM
 
-    %% S3 operations flow (via Gateway UI)
-    RBAC -->|"Authorized request"| PolicyEngine
-    PolicyEngine -->|"Enforce policies"| S3Handler
-    S3Handler -->|"User S3 client"| S3Client
-    S3Client -->|"Signed requests"| S3API
+    GroupCheck -->|"Authorized Request"| PolicyEngine
+    PolicyEngine -->|"Enforce Policies"| S3Handler
+    S3Handler --> S3Client
+    S3Client -->|"Signed Requests"| S3API
 
-    %% Styling
-    classDef clientStyle fill:#e1f5ff,stroke:#01579b,stroke-width:2px
-    classDef authStyle fill:#fff3e0,stroke:#e65100,stroke-width:2px
-    classDef coreStyle fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
-    classDef syncStyle fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px
-    classDef backendStyle fill:#fce4ec,stroke:#880e4f,stroke-width:2px
-    classDef oidcStyle fill:#fff9c4,stroke:#f57f17,stroke-width:2px
-
-    class WebUI,AWSCLI clientStyle
-    class OIDC,AccessKey,AdminCheck,GroupCheck authStyle
-    class PolicyEngine,CredStore,PolicyStore,RoleStore coreStyle
-    class FileWatcher,SyncService syncStyle
-    class S3API,IAM backendStyle
-    class AuthProvider oidcStyle
+    %% Apply styles
+    class WebUI,AWSCLI clientClass
+    class OIDC,AccessKey,AdminCheck,GroupCheck authClass
+    class PolicyEngine,CredStore,PolicyStore,RoleStore coreClass
+    class FileWatcher,SyncService syncClass
+    class S3Handler,S3Client proxyClass
+    class S3API,IAM backendClass
+    class SCIM,SCIMData,AuthProvider oidcClass
 ```
 
 ### Component Overview
@@ -138,7 +137,6 @@ flowchart TB
 - **Policy Engine**: Validates S3-only policies, enforces access control
 - **Credential Store**: Manages user-created S3 credentials (data/credentials.json)
 - **Policy Store**: Stores admin-created custom policies (data/policies/)
-- **Role Store**: Maps SCIM groups to S3 policies (data/roles/)
 
 **SCIM Integration:**
 - **File Watcher**: Monitors SCIM data directories (data/Users, data/Groups) for changes
@@ -193,11 +191,7 @@ s3:
     secret_key: "${IAM_SECRET_KEY}"
 ```
 
-4. **Define policies in policies/ directory:**
-```bash
-mkdir -p policies
-# Create policy files like admin.json, developer.json
-```
+4. **Policies are managed via the web UI by administrators**
 
 ### Running
 
@@ -230,11 +224,7 @@ The gateway uses AWS CLI for backend operations. Configure IAM credentials for a
 **Important:** All policies must contain **ONLY S3 actions** (s3:*). IAM, EC2, and other service actions are prohibited for security.
 
 ### Policy Sources
-1. **Built-in Policies** (`policies/`): Pre-defined, deployed with gateway
-   - `Read-Only.json` - S3 read operations (Get, List)
-   - `Read-Write.json` - S3 read + write operations (Get, Put, Delete, Create)
-   - `admin.json` - Full S3 access (s3:*)
-2. **User-Created Policies** (`data/policies/`): Created via web UI by admins
+- **Administrator-Created Policies** (`data/policies/`): Created and managed via web UI by admins
 
 ### Example S3-Only Policy
 ```json

@@ -274,13 +274,18 @@ Result: User can read/write but **not delete** (deny overrides allow)
 
 ## OIDC Role Mapping
 
-### Policy File Naming
+### Policy Management
 
-Policy files must match role names from OIDC claims:
+Policies are created and managed through the web UI by administrators. Roles are mapped to policies in the `data/roles/` directory.
 
-- OIDC Role: `admin` → Policy File: `policies/admin.json`
-- OIDC Role: `developer` → Policy File: `policies/developer.json`
-- OIDC Role: `data-scientist` → Policy File: `policies/data-scientist.json`
+Example role configuration (`data/roles/admin-group.json`):
+```json
+{
+  "name": "Admin Group",
+  "description": "Administrator group with full access",
+  "policies": ["admin", "Read-Write"]
+}
+```
 
 ### Roles Claim Configuration
 
@@ -300,17 +305,23 @@ Example JWT token:
 }
 ```
 
-Gateway loads policies: `developer.json` and `viewer.json`
-
 ## Policy Management
+
+### Web UI Management
+
+Policies are managed through the web interface:
+
+1. Log in as an administrator
+2. Navigate to the "Policies" tab
+3. Create, edit, or delete policies as needed
 
 ### Version Control
 
-Store policies in Git:
+Policy files are stored in `data/policies/` and can be version controlled:
 
 ```bash
-git add policies/*.json
-git commit -m "Update developer policy"
+git add data/policies/*.json
+git commit -m "Update admin policy"
 git push
 ```
 
@@ -386,7 +397,7 @@ Prevent access to sensitive data:
 ### 3. Organize by Environment
 
 ```
-policies/
+data/policies/
 ├── prod-admin.json
 ├── prod-readonly.json
 ├── dev-developer.json
@@ -426,7 +437,8 @@ Common issues:
 
 Verify:
 1. Policy file is valid JSON
-2. File is in `policies/` directory
+2. File is in `data/policies/` directory
+3. Policy is referenced in role configurations in `data/roles/`
 3. File has `.json` extension
 4. File name matches role name
 

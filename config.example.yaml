@@ -59,8 +59,8 @@ s3:
     secret_key: ""
 
 policies:
-  # Directory containing policy JSON files (synced to S3 backend)
-  directory: "./policies"
+  # Directory containing policy JSON files (admin-created policies only)
+  directory: "./data/policies"
 
   # Default policy when no roles match
   default_deny: true

@@ -386,7 +386,7 @@ func (a *Authenticator) extractUserInfoFromClaims(claims map[string]interface{})
 			groupMap[group] = true
 		}
 
-		// Add policy engine groups (from policies/ directory)
+		// Add policy engine policies (from data/policies/ directory)
 		var enginePolicies []string
 		if a.policyEngine != nil {
 			enginePolicies = a.policyEngine.GetPolicyNames()

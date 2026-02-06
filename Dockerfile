@@ -36,9 +36,6 @@ COPY --from=builder /app/s3-gateway .
 # Copy example config
 COPY config.example.yaml ./config.example.yaml
 
-# Create policies directory
-RUN mkdir -p /app/policies
-
 # Expose port
 EXPOSE 9000
 

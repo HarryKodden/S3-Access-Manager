@@ -157,10 +157,7 @@ aws --profile myprofile iam attach-group-policy --group-name mygroup --policy-ar
 #### View Policies
 
 1. Navigate to **Policies** tab
-2. Review existing policies:
-   - **Read-Only**: S3 read operations (Get, List)
-   - **Read-Write**: S3 read + write operations (Get, Put, Delete, Create)
-   - **Admin**: Full S3 access (s3:*)
+2. Review administrator-created policies
 
 #### Create New Policy
 

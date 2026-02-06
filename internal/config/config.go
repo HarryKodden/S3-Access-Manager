@@ -175,7 +175,7 @@ func Load(path string) (*Config, error) {
 		cfg.OIDC.Scopes = "openid profile email eduPersonEntitlement"
 	}
 	if cfg.Policies.Directory == "" {
-		cfg.Policies.Directory = "./policies"
+		cfg.Policies.Directory = "./data/policies"
 	}
 	if cfg.Policies.CacheTTL == 0 {
 		cfg.Policies.CacheTTL = 5 * time.Minute
