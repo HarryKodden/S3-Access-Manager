@@ -14,7 +14,6 @@ import (
 	"github.com/harrykodden/s3-gateway/internal/auth"
 	awscli "github.com/harrykodden/s3-gateway/internal/backend/aws-cli"
 	"github.com/harrykodden/s3-gateway/internal/store"
-	"github.com/harrykodden/s3-gateway/internal/sync"
 	"github.com/sirupsen/logrus"
 )
 
@@ -44,9 +43,9 @@ func NewGroupHandler(groupStore *store.GroupStore, userStore *store.UserStore, p
 	}
 }
 
-// ListGroups returns all groups with backend sync status
+// ListRoles returns all groups with backend sync status
 // For non-admin users, only returns groups matching their OIDC groups
-func (h *GroupHandler) ListGroups(c *gin.Context) {
+func (h *GroupHandler) ListRoles(c *gin.Context) {
 	// Get user info from context
 	userInfoValue, exists := c.Get("userInfo")
 	if !exists {
@@ -139,8 +138,15 @@ func (h *GroupHandler) ListGroups(c *gin.Context) {
 				if gm, ok := h.groupManager.(*awscli.GroupManager); ok {
 					backendPolicy, err := gm.GetGroupPolicy(c.Request.Context(), iamGroupName, fmt.Sprintf("%s-policy", iamGroupName))
 					if err != nil {
-						h.logger.WithError(err).WithField("group", iamGroupName).Warn("Failed to get backend policy")
-						status = "Error"
+						// Policy doesn't exist or can't be retrieved - try to create and attach it
+						h.logger.WithError(err).WithField("group", iamGroupName).Warn("Failed to get backend policy, attempting to create/attach policy")
+						if attachErr := h.createAndAttachGroupPolicy(c.Request.Context(), gm, iamGroupName, group.Policies); attachErr != nil {
+							h.logger.WithError(attachErr).WithField("group", iamGroupName).Error("Failed to create/attach policy during status check")
+							status = "Error"
+						} else {
+							h.logger.WithField("group", iamGroupName).Info("Successfully created/attached policy during status check")
+							status = "OK"
+						}
 					} else {
 						localPolicy, err := h.combineGroupPolicies(group.Policies)
 						if err != nil {
@@ -186,8 +192,8 @@ func (h *GroupHandler) ListGroups(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"groups": groupsWithStatus})
 }
 
-// ListSCIMGroups returns all SCIM groups
-func (h *GroupHandler) ListSCIMGroups(c *gin.Context) {
+// ListGroups returns all SCIM groups
+func (h *GroupHandler) ListGroups(c *gin.Context) {
 	scimGroups := h.userStore.GetAllGroups()
 
 	type SCIMGroupResponse struct {
@@ -345,11 +351,15 @@ func (h *GroupHandler) CreateGroup(c *gin.Context) {
 		return
 	}
 
-	// If scim_group_id is provided, look up the display name from SCIM
+	// If scim_group_id is provided, validate it exists in local SCIM store
+	// Note: For SRAM groups (UUIDs), we don't validate here as they come from SRAM API
 	if req.ScimGroupId != "" {
+		// Check if it's a local SCIM group (exists in userStore)
+		// SRAM group IDs are UUIDs and won't be in the local store
 		if _, exists := h.userStore.GetGroupByID(req.ScimGroupId); !exists {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid SCIM group ID"})
-			return
+			// If not found in local store, assume it's an SRAM group ID (UUID format)
+			// SRAM groups are validated when fetched from SRAM API, so we accept them here
+			h.logger.WithField("scim_group_id", req.ScimGroupId).Debug("Group ID not in local SCIM store, assuming SRAM group")
 		}
 	}
 
@@ -383,20 +393,29 @@ func (h *GroupHandler) CreateGroup(c *gin.Context) {
 		return
 	}
 
-	h.logger.WithField("name", group.Name).Info("Group created")
+	// Create IAM group in backend if groupManager is available
+	if h.groupManager != nil {
+		if gm, ok := h.groupManager.(*awscli.GroupManager); ok {
+			iamGroupName := group.Name
+			if group.ScimGroupId != "" {
+				iamGroupName = group.ScimGroupId
+			}
 
-	// Trigger targeted sync to push only this group to S3 IAM
-	if h.syncService != nil {
-		if syncSvc, ok := h.syncService.(*sync.SyncService); ok {
-			go func() {
-				if err := syncSvc.SyncGroup(context.Background(), group.ScimGroupId); err != nil {
-					h.logger.WithError(err).Error("Failed to sync group after creation")
-				} else {
-					h.logger.Info("Group sync completed after creation")
-				}
-			}()
+			if err := gm.CreateGroup(c.Request.Context(), iamGroupName); err != nil {
+				h.logger.WithError(err).WithField("group", iamGroupName).Warn("Failed to create IAM group, continuing anyway")
+				// Don't fail the request - the group exists locally and will show as "Missing" status
+			} else {
+				h.logger.WithField("group", iamGroupName).Info("Created IAM group")
+			}
+
+			// Always try to create and attach the group policy, even if group creation failed (group might already exist)
+			if err := h.createAndAttachGroupPolicy(c.Request.Context(), gm, iamGroupName, group.Policies); err != nil {
+				h.logger.WithError(err).WithField("group", iamGroupName).Warn("Failed to attach group policy")
+			}
 		}
 	}
+
+	h.logger.WithField("name", group.Name).Info("Group created")
 
 	c.JSON(http.StatusCreated, group)
 }
@@ -493,33 +512,12 @@ func (h *GroupHandler) UpdateGroup(c *gin.Context) {
 
 	h.logger.WithField("name", name).Info("Group updated")
 
-	// Trigger targeted sync to update only this group's policy in S3 IAM
-	if h.syncService != nil {
-		if syncSvc, ok := h.syncService.(*sync.SyncService); ok {
-			go func() {
-				if err := syncSvc.SyncGroupPolicy(context.Background(), existingGroup.ScimGroupId); err != nil {
-					h.logger.WithError(err).Error("Failed to sync group policy after update")
-				} else {
-					h.logger.Info("Group policy sync completed after update")
-				}
-			}()
-		}
-	}
-
 	c.JSON(http.StatusOK, group)
 }
 
 // DeleteGroup deletes a group
 func (h *GroupHandler) DeleteGroup(c *gin.Context) {
 	name := c.Param("name")
-
-	// Get the group before deleting to get SCIM ID
-	group, err := h.groupStore.Get(name)
-	if err != nil {
-		h.logger.WithError(err).WithField("name", name).Warn("Group not found for deletion")
-		c.JSON(http.StatusNotFound, gin.H{"error": "Group not found"})
-		return
-	}
 
 	// Delete from store
 	if err := h.groupStore.Delete(name); err != nil {
@@ -528,17 +526,51 @@ func (h *GroupHandler) DeleteGroup(c *gin.Context) {
 		return
 	}
 
-	// Delete from S3 IAM and cleanup credentials
-	if h.syncService != nil {
-		if syncSvc, ok := h.syncService.(*sync.SyncService); ok {
-			// Note: Using synchronous call here to ensure cleanup before response
-			if err := syncSvc.DeleteGroupAndCleanup(context.Background(), group.ScimGroupId); err != nil {
-				h.logger.WithError(err).Error("Failed to cleanup group from S3 IAM")
-				// Continue anyway - local deletion succeeded
-			}
-		}
-	}
-
 	h.logger.WithField("name", name).Info("Group deleted")
 	c.JSON(http.StatusOK, gin.H{"message": "Group deleted successfully"})
+}
+
+// createAndAttachGroupPolicy creates a policy document from the group's policies and attaches it to the IAM group
+func (h *GroupHandler) createAndAttachGroupPolicy(ctx context.Context, gm *awscli.GroupManager, iamGroupName string, policyNames []string) error {
+	if len(policyNames) == 0 {
+		h.logger.WithField("group", iamGroupName).Debug("No policies to attach to group")
+		return nil
+	}
+
+	// Combine all policy documents
+	var policyDocuments []map[string]interface{}
+	for _, policyName := range policyNames {
+		policyDoc, err := h.policyStore.Get(policyName)
+		if err != nil {
+			h.logger.WithError(err).WithField("policy", policyName).Warn("Failed to get policy document for group")
+			continue
+		}
+		policyDocuments = append(policyDocuments, policyDoc.Policy)
+	}
+
+	if len(policyDocuments) == 0 {
+		h.logger.WithField("group", iamGroupName).Warn("No valid policy documents found for group")
+		return fmt.Errorf("no valid policies found")
+	}
+
+	// Combine policies
+	combinedPolicy, err := h.combineGroupPolicies(policyNames)
+	if err != nil {
+		h.logger.WithError(err).WithField("group", iamGroupName).Warn("Failed to combine group policies")
+		return fmt.Errorf("failed to combine policies: %w", err)
+	}
+
+	// Create the group policy
+	policyName := fmt.Sprintf("%s-policy", iamGroupName)
+	if err := gm.PutGroupPolicy(ctx, iamGroupName, policyName, combinedPolicy); err != nil {
+		return fmt.Errorf("failed to put group policy: %w", err)
+	}
+
+	h.logger.WithFields(logrus.Fields{
+		"group":        iamGroupName,
+		"policy_name":  policyName,
+		"policy_count": len(policyNames),
+	}).Info("Attached combined policy to IAM group")
+
+	return nil
 }

@@ -35,8 +35,8 @@ func (h *UserHandler) ListUsers(c *gin.Context) {
 		return
 	}
 
-	// Check if user is admin
-	if userInfo.Email != h.adminUsername {
+	// Check if user is admin (global admin or tenant admin)
+	if userInfo.Role != auth.UserRoleGlobalAdmin && userInfo.Role != auth.UserRoleTenantAdmin {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Admin access required"})
 		return
 	}
@@ -81,8 +81,8 @@ func (h *UserHandler) GetUserDetails(c *gin.Context) {
 		return
 	}
 
-	// Check if user is admin
-	if userInfo.Email != h.adminUsername {
+	// Check if user is admin (global admin or tenant admin)
+	if userInfo.Role != auth.UserRoleGlobalAdmin && userInfo.Role != auth.UserRoleTenantAdmin {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Admin access required"})
 		return
 	}
@@ -128,8 +128,8 @@ func (h *UserHandler) DeleteUser(c *gin.Context) {
 		return
 	}
 
-	// Check if user is admin
-	if userInfo.Email != h.adminUsername {
+	// Check if user is admin (global admin or tenant admin)
+	if userInfo.Role != auth.UserRoleGlobalAdmin && userInfo.Role != auth.UserRoleTenantAdmin {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Admin access required"})
 		return
 	}

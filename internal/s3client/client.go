@@ -17,31 +17,32 @@ import (
 type Client struct {
 	s3Client  *s3.Client
 	awsConfig aws.Config
-	config    config.S3Config
+	s3Config  config.S3GlobalConfig
+	iamConfig config.IAMConfig
 	logger    *logrus.Logger
 }
 
 // NewClient creates a new S3 client
-func NewClient(cfg config.S3Config, logger *logrus.Logger) (*Client, error) {
+func NewClient(s3Cfg config.S3GlobalConfig, iamCfg config.IAMConfig, logger *logrus.Logger) (*Client, error) {
 	ctx := context.Background()
 
 	// Use IAM credentials for S3 operations
 	loadOpts := []func(*awsconfig.LoadOptions) error{
-		awsconfig.WithRegion(cfg.Region),
+		awsconfig.WithRegion(s3Cfg.Region),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			cfg.IAM.AccessKey,
-			cfg.IAM.SecretKey,
+			iamCfg.AccessKey,
+			iamCfg.SecretKey,
 			"",
 		)),
 	}
 
 	// Add custom endpoint resolver for non-AWS S3
-	if cfg.Endpoint != "" && cfg.Endpoint != "https://s3.amazonaws.com" {
+	if s3Cfg.Endpoint != "" && s3Cfg.Endpoint != "https://s3.amazonaws.com" {
 		loadOpts = append(loadOpts, awsconfig.WithEndpointResolver(aws.EndpointResolverFunc(func(service, region string) (aws.Endpoint, error) {
 			if service == "S3" {
 				return aws.Endpoint{
-					URL:           cfg.Endpoint,
-					SigningRegion: cfg.Region,
+					URL:           s3Cfg.Endpoint,
+					SigningRegion: s3Cfg.Region,
 				}, nil
 			}
 			return aws.Endpoint{}, &aws.EndpointNotFoundError{}
@@ -56,21 +57,22 @@ func NewClient(cfg config.S3Config, logger *logrus.Logger) (*Client, error) {
 
 	// Create S3 client with path style
 	s3ClientOpts := func(o *s3.Options) {
-		o.UsePathStyle = cfg.ForcePathStyle
+		o.UsePathStyle = s3Cfg.ForcePathStyle
 	}
 
 	s3Client := s3.NewFromConfig(awsCfg, s3ClientOpts)
 
 	logger.WithFields(logrus.Fields{
-		"region":           cfg.Region,
-		"endpoint":         cfg.Endpoint,
-		"force_path_style": cfg.ForcePathStyle,
+		"region":           s3Cfg.Region,
+		"endpoint":         s3Cfg.Endpoint,
+		"force_path_style": s3Cfg.ForcePathStyle,
 	}).Info("S3 client initialized with IAM credentials")
 
 	return &Client{
 		s3Client:  s3Client,
 		awsConfig: awsCfg,
-		config:    cfg,
+		s3Config:  s3Cfg,
+		iamConfig: iamCfg,
 		logger:    logger,
 	}, nil
 }

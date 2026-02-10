@@ -28,13 +28,14 @@ type CredentialHandler struct {
 	iamClient     *s3client.IAMClient
 	adminClient   backend.AdminClient
 	adminUsername string
-	groupManager  interface{}     // GroupManager for backend operations
-	s3Config      config.S3Config // S3 configuration for profile creation
+	groupManager  interface{}           // GroupManager for backend operations
+	s3Config      config.S3GlobalConfig // S3 configuration for profile creation
+	tenantAdmins  []string              // List of tenant admins for this tenant
 	logger        *logrus.Logger
 }
 
 // NewCredentialHandler creates a new credential handler
-func NewCredentialHandler(credStore *store.CredentialStore, groupStore *store.GroupStore, userStore *store.UserStore, policyStore *store.PolicyStore, iamClient *s3client.IAMClient, adminClient backend.AdminClient, adminUsername string, groupManager interface{}, s3Config config.S3Config, logger *logrus.Logger) *CredentialHandler {
+func NewCredentialHandler(credStore *store.CredentialStore, groupStore *store.GroupStore, userStore *store.UserStore, policyStore *store.PolicyStore, iamClient *s3client.IAMClient, adminClient backend.AdminClient, adminUsername string, groupManager interface{}, s3Config config.S3GlobalConfig, tenantAdmins []string, logger *logrus.Logger) *CredentialHandler {
 	return &CredentialHandler{
 		store:         credStore,
 		groupStore:    groupStore,
@@ -45,6 +46,7 @@ func NewCredentialHandler(credStore *store.CredentialStore, groupStore *store.Gr
 		adminUsername: adminUsername,
 		groupManager:  groupManager,
 		s3Config:      s3Config,
+		tenantAdmins:  tenantAdmins,
 		logger:        logger,
 	}
 }
@@ -192,11 +194,21 @@ func (h *CredentialHandler) ListCredentials(c *gin.Context) {
 		})
 	}
 
+	// Check if user is a tenant admin for THIS specific tenant
+	isTenantAdmin := false
+	for _, admin := range h.tenantAdmins {
+		if admin == userInfo.Email {
+			isTenantAdmin = true
+			break
+		}
+	}
+
 	c.JSON(http.StatusOK, gin.H{
-		"credentials": responses,
-		"count":       len(responses),
-		"user_groups": userInfo.OriginalGroups,
-		"is_admin":    h.adminUsername != "" && userInfo.Email == h.adminUsername,
+		"credentials":     responses,
+		"count":           len(responses),
+		"user_groups":     userInfo.OriginalGroups,
+		"is_admin":        userInfo.Role == auth.UserRoleGlobalAdmin || isTenantAdmin,
+		"is_global_admin": userInfo.Role == auth.UserRoleGlobalAdmin,
 		"user_info": gin.H{
 			"subject": userInfo.Subject,
 			"email":   userInfo.Email,
@@ -238,8 +250,8 @@ func (h *CredentialHandler) CreateCredential(c *gin.Context) {
 		"groups": req.Groups,
 	}).Info("Credential creation request validated")
 
-	// Check if user is admin
-	isAdmin := userInfo.IsAdmin
+	// Check if user is admin (global admin or tenant admin)
+	isAdmin := userInfo.Role == auth.UserRoleGlobalAdmin || userInfo.Role == auth.UserRoleTenantAdmin
 
 	// For non-admin users, validate that they can only create credentials for groups they are members of
 	if !isAdmin {
@@ -929,8 +941,8 @@ func (h *CredentialHandler) UpdateCredentials(c *gin.Context) {
 		return
 	}
 
-	// Only admin can update credentials
-	if h.adminUsername != "" && userInfo.Email != h.adminUsername {
+	// Only admin can update credentials (global admin or tenant admin)
+	if userInfo.Role != auth.UserRoleGlobalAdmin && userInfo.Role != auth.UserRoleTenantAdmin {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Admin access required"})
 		return
 	}

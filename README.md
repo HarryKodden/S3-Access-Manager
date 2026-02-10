@@ -9,12 +9,15 @@
 ## Features
 
 - 🔐 **OIDC Authentication**: Auth0, Okta, Azure AD, Keycloak, Google Identity
-- 👥 **RBAC (Role-Based Access Control)**: Admin vs User roles with different permissions
-- 🌐 **Web Management UI**: Modern interface for credential/bucket/policy management
+- 👥 **Multi-Tenant RBAC**: Global admins, tenant admins, and users with hierarchical permissions
+- 🏢 **Multi-Tenancy Support**: Complete isolation between tenants with separate credentials, policies, and configurations
+- 🌐 **Web Management UI**: Modern interface for tenant, credential, bucket, and policy management
 - 🎯 **Group-Based Access Control**: Map OIDC claims to S3 policies
 - 🔄 **Automatic SCIM Sync**: File watcher triggers IAM sync on SCIM data changes
+- 🤝 **SRAM Integration**: SURF Research Access Management for collaboration and user invitations
 - 🔑 **Self-Service Credentials**: Users create S3 access keys with delegated policies
-- 🛡️ **Policy-Based Permissions**: Fine-grained access control with custom policies
+- 🛡️ **Tenant-Specific Permissions**: Tenant admins manage their tenant; users limited to their groups
+- 📋 **Policy-Based Permissions**: Fine-grained access control with custom policies
 - 🌐 **S3 Browser**: Visual file management with upload/download
 - 📈 **Prometheus Metrics**: Built-in monitoring endpoint
 - 🐳 **Docker Ready**: Complete containerization
@@ -33,6 +36,7 @@ flowchart TB
     classDef proxyClass fill:#fce4ec,stroke:#c2185b,stroke-width:2px,color:#880e4f
     classDef backendClass fill:#fff9c4,stroke:#f9a825,stroke-width:2px,color:#f57f17
     classDef oidcClass fill:#e1f5fe,stroke:#0277bd,stroke-width:2px,color:#01579b
+    classDef tenantClass fill:#fff8e1,stroke:#ffa000,stroke-width:2px,color:#ff6f00
 
     %% Clients
     subgraph "👥 Clients"
@@ -50,15 +54,26 @@ flowchart TB
         end
 
         subgraph "🛡️ Authorization"
-            AdminCheck["Admin Check<br/>IsAdmin flag"]
+            GlobalAdmin["Global Admin Check<br/>System-wide access"]
+            TenantAdmin["Tenant Admin Check<br/>Per-tenant access"]
             GroupCheck["Group Validation<br/>OIDC Groups claim"]
         end
 
-        subgraph "🏗️ Core Services"
+        subgraph "🏢 Multi-Tenancy"
+            TenantRouter["Tenant Router<br/>/tenant/:name/*"]
+            TenantSelection["Tenant Selection<br/>Non-global admin flow"]
+        end
+
+        subgraph "🏗️ Core Services (Per-Tenant)"
             PolicyEngine["Policy Engine<br/>Validation & Enforcement"]
-            CredStore["Credential Store<br/>data/credentials.json"]
-            PolicyStore["Policy Store<br/>data/policies/"]
-            RoleStore["Role Store<br/>data/roles/"]
+            CredStore["Credential Store<br/>data/&lt;tenant&gt;/credentials.json"]
+            PolicyStore["Policy Store<br/>data/&lt;tenant&gt;/policies/"]
+            RoleStore["Role Store<br/>data/&lt;tenant&gt;/roles/"]
+        end
+
+        subgraph "🤝 SRAM Integration"
+            SRAMClient["SRAM Client<br/>Collaboration API"]
+            InvitationMgmt["Invitation Management<br/>User onboarding"]
         end
 
         subgraph "🔄 Synchronization"
@@ -78,7 +93,7 @@ flowchart TB
         SCIMData["SCIM Data<br/>JSON files"]
     end
 
-    subgraph "☁️ S3 Backend"
+    subgraph "☁️ S3 Backend (Per-Tenant)"
         S3API["S3 API<br/>Bucket/Object ops"]
         IAM["IAM Service<br/>User/Policy mgmt"]
     end
@@ -87,19 +102,38 @@ flowchart TB
         AuthProvider["Auth0 / Okta / Keycloak<br/>Authentication"]
     end
 
-    %% Connections
+    subgraph "🤝 SRAM Service"
+        SRAMApi["SRAM API<br/>SURF Research Access Mgmt"]
+    end
+
+    %% Connections - Authentication Flow
     WebUI -->|"1. OIDC Login"| OIDC
-    WebUI -->|"2. Management"| AdminCheck
+    WebUI -->|"2. Tenant Selection"| TenantSelection
+    WebUI -->|"3. Management"| TenantRouter
     AWSCLI -->|"S3 Operations"| AccessKey
 
     OIDC -->|"Validate Token"| AuthProvider
     OIDC -->|"Extract Groups"| GroupCheck
+    TenantSelection -->|"Select Tenant"| TenantRouter
+    
+    %% Authorization Flow
+    TenantRouter -->|"Check Role"| GlobalAdmin
+    TenantRouter -->|"Check Role"| TenantAdmin
+    GlobalAdmin -->|"System Admin"| PolicyStore
+    GlobalAdmin -->|"System Admin"| RoleStore
+    TenantAdmin -->|"Tenant Admin"| PolicyStore
+    TenantAdmin -->|"Tenant Admin"| RoleStore
+    
     AccessKey -->|"Verify Credentials"| CredStore
-
-    AdminCheck -->|"Admin Users"| PolicyStore
-    AdminCheck -->|"Admin Users"| RoleStore
     GroupCheck -->|"All Users"| CredStore
 
+    %% SRAM Integration
+    GlobalAdmin -->|"Create Tenant"| SRAMClient
+    SRAMClient -->|"Create Collaboration"| SRAMApi
+    SRAMClient -->|"Send Invitations"| SRAMApi
+    SRAMApi -->|"Invitation Status"| InvitationMgmt
+
+    %% SCIM Sync Flow
     SCIM --> SCIMData
     SCIMData -->|"File Changes"| FileWatcher
     FileWatcher -->|"Trigger Sync"| SyncService
@@ -108,9 +142,11 @@ flowchart TB
     RoleStore -.->|"Policy Mappings"| SyncService
     PolicyStore -.->|"Policy Definitions"| SyncService
 
-    AdminCheck -->|"Create Credential"| CredStore
+    %% Credential Management
+    TenantAdmin -->|"Create Credential"| CredStore
     CredStore -->|"Register in IAM"| IAM
 
+    %% S3 Operations Flow
     GroupCheck -->|"Authorized Request"| PolicyEngine
     PolicyEngine -->|"Enforce Policies"| S3Handler
     S3Handler --> S3Client
@@ -118,12 +154,15 @@ flowchart TB
 
     %% Apply styles
     class WebUI,AWSCLI clientClass
-    class OIDC,AccessKey,AdminCheck,GroupCheck authClass
+    class OIDC,AccessKey authClass
+    class GlobalAdmin,TenantAdmin,GroupCheck authClass
+    class TenantRouter,TenantSelection tenantClass
     class PolicyEngine,CredStore,PolicyStore,RoleStore coreClass
+    class SRAMClient,InvitationMgmt syncClass
     class FileWatcher,SyncService syncClass
     class S3Handler,S3Client proxyClass
     class S3API,IAM backendClass
-    class SCIM,SCIMData,AuthProvider oidcClass
+    class SCIM,SCIMData,AuthProvider,SRAMApi oidcClass
 ```
 
 ### Component Overview
@@ -131,29 +170,48 @@ flowchart TB
 **Authentication & Authorization:**
 - **OIDC Auth**: Web UI users authenticate via external OIDC provider, session-based
 - **Access Key Auth**: CLI users authenticate with AWS Signature v4 (access/secret keys)
-- **RBAC**: Admin role (IsAdmin flag) manages policies/roles; users limited to their groups
+- **Multi-Level RBAC**: 
+  - **Global Admins**: Full system access, manage all tenants, create new tenants
+  - **Tenant Admins**: Manage specific tenant (policies, roles, users)
+  - **Users**: Limited to their assigned groups and credentials
 
-**Core Services:**
+**Multi-Tenancy:**
+- **Tenant Router**: Routes requests to specific tenant contexts (`/tenant/:name/*`)
+- **Tenant Selection**: Non-global admin users select their tenant on login
+- **Tenant Isolation**: Complete separation of credentials, policies, roles, and IAM resources
+- **Per-Tenant Configuration**: Each tenant has dedicated IAM credentials and settings
+
+**Core Services (Per-Tenant):**
 - **Policy Engine**: Validates S3-only policies, enforces access control
-- **Credential Store**: Manages user-created S3 credentials (data/credentials.json)
-- **Policy Store**: Stores admin-created custom policies (data/policies/)
+- **Credential Store**: Manages user-created S3 credentials (`data/<tenant>/credentials.json`)
+- **Policy Store**: Stores admin-created custom policies (`data/<tenant>/policies/`)
+- **Role Store**: Manages group-to-policy mappings (`data/<tenant>/roles/`)
 
-**SCIM Integration:**
-- **File Watcher**: Monitors SCIM data directories (data/Users, data/Groups) for changes
-- **Sync Service**: Automatically syncs SCIM users/groups to S3 IAM users/policies
+**SRAM Integration (SURF Research Access Management):**
+- **Collaboration Creation**: Automatically creates SRAM collaborations for new tenants
+- **Invitation Management**: Send and track user invitations to tenant collaborations
+- **Auto-Service Connection**: Automatically connects services to collaborations when admins are present but no services are connected
+- **Status Tracking**: Monitor invitation acceptance and user onboarding
+- **API Integration**: RESTful integration with SRAM platform
+
+**SCIM Integration (Per-Tenant):**
+- **File Watcher**: Monitors global SCIM data directories (`data/scim/Users`, `data/scim/Groups`)
+- **Sync Service**: Automatically syncs SCIM users/groups to tenant-specific IAM users/policies
 - **Debouncing**: 2-second delay to batch rapid SCIM updates
+- **Per-Tenant Sync**: Each tenant has isolated IAM resources but shares global SCIM source
 
 **S3 Operations:**
 - **S3 Handler**: Processes bucket/object operations, enforces policies
 - **S3 Client**: Creates user-specific S3 clients with delegated credentials
 - **Backend**: Ceph/MinIO/AWS S3 with IAM for user/policy management
+- **Per-Tenant Isolation**: Each tenant uses separate IAM credentials
 
 ## Quick Start
 
 ### Prerequisites
 - Docker & Docker Compose
 - OIDC provider (Auth0, Okta, Azure AD, Keycloak, etc.)
-- S3 backend (MinIO, AWS S3, CEPH)
+- S3 backend (MinIO, AWS S3, CEPH, etc)
 
 ### Setup
 
@@ -171,14 +229,27 @@ cp .env.example .env
 OIDC_ISSUER=https://your-oidc-provider.com
 OIDC_CLIENT_ID=your-client-id
 OIDC_CLIENT_SECRET=your-client-secret
+OIDC_SCOPES="openid profile email groups"
+OIDC_SESSION_CACHE_TTL=15m
 
 # S3 Backend
 S3_ENDPOINT=https://s3.amazonaws.com
 S3_REGION=us-east-1
+S3_FORCE_PATH_STYLE=false
 
-# IAM Admin Credentials (for user/policy management)
-IAM_ACCESS_KEY=your-admin-access-key
-IAM_SECRET_KEY=your-admin-secret-key
+# SCIM (optional)
+SCIM_API_KEY=your-scim-api-key
+
+# SRAM (optional)
+SRAM_API_URL=https://acc.sram.surf.nl
+SRAM_API_KEY=your-sram-api-key
+SRAM_ENABLED=true
+
+# Global Admins
+GLOBAL_ADMINS=admin@example.com,superadmin@example.com
+
+# IAM credentials are now configured per tenant in data/tenants/<tenant>/config.yaml
+# Each tenant requires its own IAM access key and secret key for AWS operations
 ```
 
 3. **Configure S3 backend in config.yaml:**
@@ -186,9 +257,15 @@ IAM_SECRET_KEY=your-admin-secret-key
 s3:
   endpoint: "${S3_ENDPOINT}"
   region: "${S3_REGION}"
-  iam:
-    access_key: "${IAM_ACCESS_KEY}"
-    secret_key: "${IAM_SECRET_KEY}"
+```
+
+4. **Create tenant configuration in data/tenants/<tenant>/config.yaml:**
+```yaml
+tenant_admins:
+- "admin@example.com"
+iam:
+  access_key: "your-tenant-iam-access-key"
+  secret_key: "your-tenant-iam-secret-key"
 ```
 
 4. **Policies are managed via the web UI by administrators**
@@ -211,6 +288,109 @@ Access at `http://localhost`:
 ### Configuration
 The gateway uses AWS CLI for backend operations. Configure IAM credentials for admin operations.
 
+### Multi-Tenant Configuration
+The gateway supports multi-tenant deployments where each tenant has isolated users, groups, policies, credentials, and IAM resources. OIDC and SCIM are configured globally and shared across all tenants.
+
+#### Tenant Structure
+```
+data/
+├── scim/                    # Global SCIM data (shared)
+│   ├── Groups/              # SCIM group data
+│   └── Users/               # SCIM user data
+├── <tenant-name>/
+│   ├── config.yaml          # Tenant-specific configuration
+│   ├── credentials.json     # Tenant user credentials
+│   ├── policies/            # IAM policies
+│   └── roles/               # Role-to-policy mappings
+```
+
+#### Global Configuration (`config.yaml`)
+```yaml
+# Global OIDC Configuration (shared across all tenants)
+oidc:
+  issuer: "https://oidc-provider.com"
+  client_id: "global-client-id"
+  client_secret: "global-client-secret"
+  scopes: "openid profile email groups"
+  groups_claim: "groups"
+  user_claim: "sub"
+  email_claim: "email"
+  session_cache_ttl: 15m
+
+# Global SCIM Configuration (shared across all tenants)
+scim:
+  api_key: "global-scim-secret-key"
+
+# SRAM Configuration (SURF Research Access Management)
+sram:
+  api_url: "https://sram.surf.nl"
+  api_key: "your-sram-api-key"
+  enabled: true
+
+# Global Administrators (email addresses with full system access)
+global_admins:
+  - "admin@example.com"
+
+# Global S3 Configuration
+s3:
+  endpoint: "https://s3.amazonaws.com"
+  region: "us-east-1"
+  force_path_style: false
+```
+
+#### Tenant Configuration (`data/<tenant>/config.yaml`)
+```yaml
+name: "example-tenant"
+
+# Tenant administrators (email addresses with admin access to this tenant)
+tenant_admins:
+  - "admin@example-tenant.com"
+
+# Tenant-specific IAM credentials (required per tenant)
+iam:
+  access_key: "tenant-iam-access-key"
+  secret_key: "tenant-iam-secret-key"
+
+# SRAM Collaboration ID (automatically set when tenant is created via UI)
+sram_collaboration_id: "collaboration-uuid"
+```
+
+#### User Roles & Access Levels
+
+**Global Administrator** (`global_admins` in root config.yaml):
+- Full system access
+- Create, edit, and delete tenants
+- Access all tenant resources
+- Manage SRAM collaborations and invitations
+- View Tenants management tab
+- Not shown Credentials tab at root level
+
+**Tenant Administrator** (`tenant_admins` in tenant config.yaml):
+- Manage specific tenant only
+- Create, edit, delete policies and roles
+- Manage tenant users and credentials
+- Cannot create new tenants
+- Must select tenant on login
+- Shown Policies and Roles tabs only in their tenant
+
+**Regular User**:
+- Access assigned tenants based on group membership
+- Create and manage own credentials
+- View policies and roles
+- Upload/download to permitted buckets
+- Must select tenant on login
+- Shown Credentials tab only
+
+#### Benefits
+- **Isolation**: Each tenant has separate credentials, policies, roles, and IAM resources
+- **Centralized Identity**: Single OIDC provider and SCIM source for all tenants
+- **Security**: Tenant-specific IAM credentials ensure data separation
+- **Scalability**: Easy to add/remove tenants without affecting others
+- **SRAM Integration**: Automated collaboration creation and invitation management
+- **Role-Based Access**: Granular permissions at global, tenant, and user levels
+- **Self-Service**: Tenant admins can manage their own resources independently
+- **Simplified Management**: Global OIDC and SCIM configuration reduces complexity
+
 ## Documentation
 
 - 📘 **[Quick Reference](QUICKREF.md)** - Essential commands and workflows
@@ -232,7 +412,6 @@ The gateway uses AWS CLI for backend operations. Configure IAM credentials for a
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "S3BucketAccess",
       "Effect": "Allow",
       "Action": [
         "s3:GetObject",
@@ -370,7 +549,7 @@ aws --profile myprofile iam create-group --group-name newgroup
 
 **Manage Groups (SCIM):**
 - Groups are provisioned via SCIM API (external system)
-- Groups stored in `/data/Groups/`
+- Groups stored in `/data/scim/Groups/`
 - Gateway reads SCIM groups and matches to OIDC Groups claim
 - Admins attach policies to SCIM groups via Web UI
 
@@ -379,9 +558,11 @@ aws --profile myprofile iam create-group --group-name newgroup
 Modern interface at `http://localhost`:
 
 - **Authentication**: OIDC login with admin/regular user roles
-- **Credentials**: Self-service creation with policy delegation
+- **Tenant Management**: Global admins can create and manage tenants
+- **Credentials**: Self-service creation with policy delegation (only shown on tenant pages)
 - **Buckets**: Visual browser with upload/download
-- **Policies**: View (users) or manage (admins)
+- **Policies**: View (users) or manage (tenant admins)
+- **Roles**: Group-to-policy mappings (tenant admins only)
 - **Admin Mode**: Toggle to test regular user experience
 
 ## Development
@@ -406,11 +587,29 @@ make build
 # Start services
 docker compose up -d
 
-# Run tests
+# Run E2E workflow tests
 ./demo-flow.sh
 
+# Run SRAM integration tests (unit tests)
+go test -v ./internal/sram/
+
+# Test SRAM API directly
+export SRAM_API_URL=https://your-sram-instance.com
+export SRAM_API_KEY=your-api-key
+./test-sram-api.sh
 ```
 
-## License
+For comprehensive SRAM integration testing, see [SRAM Testing Guide](docs/SRAM_TESTING_GUIDE.md).
+
+## Documentation
+
+- [API Documentation](docs/API.md) - REST API endpoints and examples
+- [Credentials Management](docs/CREDENTIALS.md) - User credential lifecycle
+- [OIDC Authentication](docs/OIDC_AUTHENTICATION.md) - OIDC setup and configuration
+- [Policies](docs/POLICIES.md) - Policy engine and access control
+- [Secure Configuration](docs/SECURE_CONFIG.md) - Production security hardening
+- [Usage Guide](docs/USAGE_GUIDE.md) - End-user guide
+- [SRAM Testing Guide](docs/SRAM_TESTING_GUIDE.md) - SRAM integration testing
+
 
 MIT

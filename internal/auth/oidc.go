@@ -46,10 +46,20 @@ type Authenticator struct {
 	policyEngine    PolicyEngine
 	policyStore     PolicyStore
 	userStore       UserStore
-	adminUsers      []string
+	globalAdmins    []string
+	tenantConfigs   map[string]config.TenantConfig
 	sessionCache    map[string]*sessionCacheEntry // token -> cached session
 	cacheMutex      sync.RWMutex
 }
+
+// UserRole represents the role of a user
+type UserRole string
+
+const (
+	UserRoleGlobalAdmin UserRole = "global_admin"
+	UserRoleTenantAdmin UserRole = "tenant_admin"
+	UserRoleUser        UserRole = "user"
+)
 
 // UserInfo contains authenticated user information
 type UserInfo struct {
@@ -57,12 +67,12 @@ type UserInfo struct {
 	Email          string
 	Groups         []string // Effective groups (includes all policies for admin users)
 	OriginalGroups []string // Original OIDC groups (before policy expansion)
-	IsAdmin        bool     // True if user is an admin
+	Role           UserRole // User's role: global_admin, tenant_admin, or user
 	Claims         map[string]interface{}
 }
 
 // NewOIDCAuthenticator creates a new OIDC authenticator
-func NewOIDCAuthenticator(cfg config.OIDCConfig, logger *logrus.Logger, policyEngine PolicyEngine, policyStore PolicyStore, userStore UserStore, adminUsers []string) (*Authenticator, error) {
+func NewOIDCAuthenticator(cfg config.OIDCConfig, logger *logrus.Logger, policyEngine PolicyEngine, policyStore PolicyStore, userStore UserStore, globalAdmins []string, tenantConfigs map[string]config.TenantConfig) (*Authenticator, error) {
 	ctx := context.Background()
 
 	// Discover userinfo endpoint from OIDC discovery document
@@ -86,7 +96,8 @@ func NewOIDCAuthenticator(cfg config.OIDCConfig, logger *logrus.Logger, policyEn
 		policyEngine:    policyEngine,
 		policyStore:     policyStore,
 		userStore:       userStore,
-		adminUsers:      adminUsers,
+		globalAdmins:    globalAdmins,
+		tenantConfigs:   tenantConfigs,
 		sessionCache:    make(map[string]*sessionCacheEntry),
 	}, nil
 }
@@ -377,9 +388,11 @@ func (a *Authenticator) extractUserInfoFromClaims(claims map[string]interface{})
 		userInfo.OriginalGroups = []string{}
 	}
 
-	// For admin users, add all policy names from BOTH sources to their groups
-	if a.isAdminUser(userInfo.Subject, userInfo.Email) {
-		userInfo.IsAdmin = true
+	// Determine user role
+	userInfo.Role = a.determineUserRole(userInfo.Subject, userInfo.Email)
+
+	// For admin users (global or tenant), add all policy names from BOTH sources to their groups
+	if userInfo.Role == UserRoleGlobalAdmin || userInfo.Role == UserRoleTenantAdmin {
 		// Build a set to avoid duplicates
 		groupMap := make(map[string]bool)
 		for _, group := range userInfo.Groups {
@@ -504,12 +517,24 @@ func (a *Authenticator) extractGroups(claims map[string]interface{}) []string {
 	return groups
 }
 
-// isAdminUser checks if a user is an admin based on subject or email
-func (a *Authenticator) isAdminUser(subject, email string) bool {
-	for _, adminUser := range a.adminUsers {
-		if adminUser == subject || adminUser == email {
-			return true
+// determineUserRole determines the role of a user based on global admins and tenant admins
+func (a *Authenticator) determineUserRole(subject, email string) UserRole {
+	// Check if user is a global admin
+	for _, globalAdmin := range a.globalAdmins {
+		if globalAdmin == subject || globalAdmin == email {
+			return UserRoleGlobalAdmin
 		}
 	}
-	return false
+
+	// Check if user is a tenant admin in any tenant
+	for _, tenantConfig := range a.tenantConfigs {
+		for _, tenantAdmin := range tenantConfig.TenantAdmins {
+			if tenantAdmin == subject || tenantAdmin == email {
+				return UserRoleTenantAdmin
+			}
+		}
+	}
+
+	// Default to regular user
+	return UserRoleUser
 }

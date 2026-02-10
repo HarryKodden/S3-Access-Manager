@@ -4,6 +4,18 @@ server:
   read_timeout: 30s
   write_timeout: 30s
 
+# Tenant Configuration (Multi-Tenant Setup)
+# ===========================================
+# If tenant is specified, tenant-specific config will be loaded from ./data/<tenant>/config.yaml
+# This enables complete isolation between tenants (users, groups, policies, credentials, OIDC)
+# tenant:
+#   name: "my-tenant"  # Tenant identifier (used in URLs: /tenant/my-tenant/...)
+#   data_dir: "./data/my-tenant"  # Optional, defaults to ./data/<name>
+
+# Global OIDC Configuration (Single-Tenant or Fallback)
+# ======================================================
+# For single-tenant deployments, configure OIDC here
+# For multi-tenant deployments, OIDC config moves to ./data/<tenant>/config.yaml
 oidc:
   # Your OIDC provider's issuer URL
   # RECOMMENDED: Set via OIDC_ISSUER environment variable
@@ -50,13 +62,8 @@ s3:
   # Set via S3_FORCE_PATH_STYLE environment variable
   force_path_style: false
 
-  # IAM admin credentials for user/policy management on S3 backend
-  iam:
-    # SECURITY: Set these via environment variables instead:
-    #   IAM_ACCESS_KEY
-    #   IAM_SECRET_KEY
-    access_key: ""
-    secret_key: ""
+# IAM credentials are configured per tenant in ./data/<tenant>/config.yaml
+# Each tenant requires its own IAM access key and secret key for AWS operations
 
 policies:
   # Directory containing policy JSON files (admin-created policies only)
@@ -77,26 +84,46 @@ roles:
 # SCIM Configuration
 users:
   # Directory for SCIM user data
-  directory: "./data/Users"
+  directory: "./data/scim/Users"
 
 groups:
   # Directory for SCIM group data (candidate groups for policy assignment)
-  directory: "./data/Groups"
+  directory: "./data/scim/Groups"
 
-# Admin Configuration
-admin:
-  # Admin user's email/username (user with this identity gets admin privileges)
-  # RECOMMENDED: Set via ADMIN environment variable
-  # Example: "admin@example.com"
-  # Admin users can:
-  #   - Create/edit/delete policies
-  #   - Create/edit/delete roles
-  #   - View and manage all users
-  #   - Create credentials for any group
-  # Regular users can only:
-  #   - Create credentials for groups they belong to
-  #   - View their own credentials
-  username: ""
+# SCIM Server Configuration
+# =========================
+# Settings for the external SCIM server used for user/group provisioning
+# For multi-tenant setups, this moves to ./data/<tenant>/config.yaml
+scim:
+  # API key for authenticating with the SCIM server
+  # RECOMMENDED: Set via SCIM_API_KEY environment variable
+  api_key: ""
+
+# SRAM Configuration (SURF Research Access Management)
+# ====================================================
+# SRAM integration for collaboration and invitation management
+sram:
+  # SRAM API base URL
+  # Use https://acc.sram.surf.nl for testing/acceptance
+  # Use https://sram.surf.nl for production
+  # RECOMMENDED: Set via SRAM_API_URL environment variable
+  api_url: "https://acc.sram.surf.nl"
+
+  # SRAM API key for authentication
+  # SECURITY: Set via SRAM_API_KEY environment variable
+  api_key: ""
+
+  # Enable/disable SRAM integration
+  # Set via SRAM_ENABLED environment variable (true/false)
+  enabled: false
+
+# Global Administrators
+# Email addresses of users with full system administration privileges
+# These users can manage all tenants, global configuration, and perform any operation
+# RECOMMENDED: Set via GLOBAL_ADMINS environment variable (comma-separated)
+global_admins:
+  # - "admin@example.com"
+  # - "superadmin@company.com"
 
 logging:
   # Log level: debug, info, warn, error

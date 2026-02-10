@@ -26,37 +26,61 @@ import (
 
 // S3Handler handles S3 proxy requests
 type S3Handler struct {
-	s3Client     *s3client.Client // Root client for admin operations only
-	s3Config     config.S3Config  // S3 configuration for endpoint/region
-	credStore    *store.CredentialStore
-	groupStore   *store.GroupStore
-	userStore    *store.UserStore
-	policyEngine *policy.Engine
-	logger       *logrus.Logger
+	s3Client      *s3client.Client               // Root client for admin operations only
+	s3Config      config.S3GlobalConfig          // S3 configuration for endpoint/region
+	iamClients    map[string]*s3client.IAMClient // Tenant IAM clients
+	credStores    map[string]*store.CredentialStore
+	groupStore    *store.GroupStore // Global SCIM group store
+	userStore     *store.UserStore  // Global SCIM user store
+	policyEngines map[string]*policy.Engine
+	logger        *logrus.Logger
 }
 
 // NewS3Handler creates a new S3 handler
-func NewS3Handler(client *s3client.Client, s3Cfg config.S3Config, credStore *store.CredentialStore, groupStore *store.GroupStore, userStore *store.UserStore, policyEngine *policy.Engine, logger *logrus.Logger) *S3Handler {
+func NewS3Handler(client *s3client.Client, s3Cfg config.S3GlobalConfig, iamClients map[string]*s3client.IAMClient, credStores map[string]*store.CredentialStore, groupStore *store.GroupStore, userStore *store.UserStore, policyEngines map[string]*policy.Engine, logger *logrus.Logger) *S3Handler {
 	return &S3Handler{
-		s3Client:     client,
-		s3Config:     s3Cfg,
-		credStore:    credStore,
-		groupStore:   groupStore,
-		userStore:    userStore,
-		policyEngine: policyEngine,
-		logger:       logger,
+		s3Client:      client,
+		s3Config:      s3Cfg,
+		iamClients:    iamClients,
+		credStores:    credStores,
+		groupStore:    groupStore,
+		userStore:     userStore,
+		policyEngines: policyEngines,
+		logger:        logger,
 	}
 }
 
-// CreateUserS3Client creates an S3 client using user's delegated credentials
-func (h *S3Handler) CreateUserS3Client(ctx context.Context, cred *store.Credential) (*s3.Client, error) {
-	// For S3 operations, use admin credentials since user access keys may not be valid on remote backends
-	// The policy enforcement happens at the gateway level, not at the S3 backend level
+// getTenantServices returns tenant-specific services for the given gin context
+func (h *S3Handler) getTenantServices(c *gin.Context) (*store.CredentialStore, *store.GroupStore, *store.UserStore, *policy.Engine, error) {
+	tenantName := c.GetString("tenant")
+	if tenantName == "" {
+		return nil, nil, nil, nil, fmt.Errorf("tenant not found in context")
+	}
+
+	credStore, credExists := h.credStores[tenantName]
+	policyEngine, policyExists := h.policyEngines[tenantName]
+
+	if !credExists || !policyExists {
+		return nil, nil, nil, nil, fmt.Errorf("services not found for tenant %s", tenantName)
+	}
+
+	return credStore, h.groupStore, h.userStore, policyEngine, nil
+}
+
+// CreateUserS3Client creates an S3 client with user-specific credentials
+func (h *S3Handler) CreateUserS3Client(ctx context.Context, tenantName string, cred *store.Credential) (*s3.Client, error) {
+	// Get tenant-specific IAM client (for validation)
+	_, exists := h.iamClients[tenantName]
+	if !exists {
+		return nil, fmt.Errorf("IAM client not found for tenant %s", tenantName)
+	}
+
+	// Create AWS config with user credentials
 	loadOpts := []func(*awsconfig.LoadOptions) error{
 		awsconfig.WithRegion(h.s3Config.Region),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			h.s3Config.IAM.AccessKey, // Use admin access key for S3 operations
-			h.s3Config.IAM.SecretKey, // Use admin secret key for S3 operations
+			cred.AccessKey,
+			cred.SecretKey,
 			"",
 		)),
 	}
@@ -76,7 +100,7 @@ func (h *S3Handler) CreateUserS3Client(ctx context.Context, cred *store.Credenti
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, loadOpts...)
 	if err != nil {
-		return nil, fmt.Errorf("failed to load AWS config with user credentials: %w", err)
+		return nil, fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
 	// Create S3 client with path style
@@ -115,6 +139,20 @@ func (h *S3Handler) getActionFromMethod(method, bucket, key string) string {
 // ProxyRequest proxies S3 requests after authorization
 func (h *S3Handler) ProxyRequest(c *gin.Context) {
 	startTime := time.Now()
+
+	// Get tenant-specific services
+	credStore, groupStore, _, policyEngine, err := h.getTenantServices(c)
+	if err != nil {
+		h.logger.WithError(err).Error("Failed to get tenant services")
+		c.Header("Content-Type", "application/xml")
+		c.XML(http.StatusInternalServerError, gin.H{
+			"Error": gin.H{
+				"Code":    "InternalError",
+				"Message": "Tenant configuration error",
+			},
+		})
+		return
+	}
 
 	// Extract user info from context (set by auth middleware)
 	userInfoValue, exists := c.Get("userInfo")
@@ -160,8 +198,7 @@ func (h *S3Handler) ProxyRequest(c *gin.Context) {
 		}
 
 		// Get credential from store
-		var err error
-		cred, err = h.credStore.Get(accessKey)
+		cred, err = credStore.Get(accessKey)
 		if err != nil {
 			c.Header("Content-Type", "application/xml")
 			c.XML(http.StatusNotFound, gin.H{
@@ -249,7 +286,7 @@ func (h *S3Handler) ProxyRequest(c *gin.Context) {
 		scimGroupId := groupName
 
 		if scimGroupId != "" {
-			group, err := h.groupStore.Get(scimGroupId)
+			group, err := groupStore.Get(scimGroupId)
 			if err != nil {
 				h.logger.WithError(err).WithField("group", groupName).Warn("Failed to get group definition")
 				continue
@@ -268,7 +305,7 @@ func (h *S3Handler) ProxyRequest(c *gin.Context) {
 		Policies: applicablePolicies,
 	}
 
-	decision := h.policyEngine.Evaluate(policyCtx)
+	decision := policyEngine.Evaluate(policyCtx)
 	if !decision.Allowed {
 		h.logger.WithFields(logrus.Fields{
 			"user":     userInfo.Email,
@@ -294,7 +331,8 @@ func (h *S3Handler) ProxyRequest(c *gin.Context) {
 	}).Debug("Policy evaluation allowed S3 operation")
 
 	// Create S3 client using user's delegated credentials
-	s3Client, err := h.CreateUserS3Client(c.Request.Context(), cred)
+	tenantName := c.GetString("tenant")
+	s3Client, err := h.CreateUserS3Client(c.Request.Context(), tenantName, cred)
 	if err != nil {
 		h.logger.WithError(err).WithFields(logrus.Fields{
 			"user":       userInfo.Email,
@@ -353,6 +391,21 @@ func (h *S3Handler) ProxyToS3(c *gin.Context, s3Client *s3.Client, bucket, key s
 // ListBuckets handles S3 list buckets operation for AWS CLI compatibility
 func (h *S3Handler) ListBuckets(c *gin.Context) {
 	h.logger.Info("ListBuckets called")
+
+	// Get tenant-specific services
+	_, groupStore, _, policyEngine, err := h.getTenantServices(c)
+	if err != nil {
+		h.logger.WithError(err).Error("Failed to get tenant services")
+		c.Header("Content-Type", "application/xml")
+		c.XML(http.StatusInternalServerError, gin.H{
+			"Error": gin.H{
+				"Code":    "InternalError",
+				"Message": "Tenant configuration error",
+			},
+		})
+		return
+	}
+
 	// Extract user info from context (set by auth middleware)
 	userInfoValue, exists := c.Get("userInfo")
 	if !exists {
@@ -409,7 +462,7 @@ func (h *S3Handler) ListBuckets(c *gin.Context) {
 	for _, groupName := range userInfo.Groups {
 		scimGroupId := groupName
 		if scimGroupId != "" {
-			group, err := h.groupStore.Get(scimGroupId)
+			group, err := groupStore.Get(scimGroupId)
 			if err != nil {
 				h.logger.WithError(err).WithField("group", groupName).Warn("Failed to get group definition")
 				continue
@@ -428,7 +481,7 @@ func (h *S3Handler) ListBuckets(c *gin.Context) {
 		Groups:   userInfo.Groups,
 		Policies: applicablePolicies,
 	}
-	decision := h.policyEngine.Evaluate(policyCtx)
+	decision := policyEngine.Evaluate(policyCtx)
 	h.logger.WithFields(logrus.Fields{
 		"action":   "s3:ListAllMyBuckets",
 		"allowed":  decision.Allowed,

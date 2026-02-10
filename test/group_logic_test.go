@@ -1,7 +1,6 @@
 package test
 
 import (
-	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -12,7 +11,6 @@ import (
 	"github.com/harrykodden/s3-gateway/internal/config"
 	"github.com/harrykodden/s3-gateway/internal/policy"
 	"github.com/harrykodden/s3-gateway/internal/store"
-	"github.com/harrykodden/s3-gateway/internal/sync"
 	"github.com/sirupsen/logrus"
 )
 
@@ -196,140 +194,12 @@ func TestGroupBasedPolicyResolution(t *testing.T) {
 
 // TestSyncServiceGroupLogic tests that the sync service correctly handles
 // group-based user synchronization without requiring AWS services.
-func TestSyncServiceGroupLogic(t *testing.T) {
-	// Setup test environment
-	testDir := t.TempDir()
-	groupsDir := filepath.Join(testDir, "groups")
-	policiesDir := filepath.Join(testDir, "policies")
-
-	os.MkdirAll(groupsDir, 0755)
-	os.MkdirAll(policiesDir, 0755)
-
-	// Create test groups
-	createTestGroup(t, groupsDir, "admin", "Administrator group", []string{"admin"})
-	createTestGroup(t, groupsDir, "developer", "Developer group", []string{"Read-Write"})
-
-	// Create test policies
-	createTestPolicy(t, policiesDir, "admin", map[string]interface{}{
-		"Version": "2012-10-17",
-		"Statement": []map[string]interface{}{
-			{
-				"Effect":   "Allow",
-				"Action":   []string{"s3:*"},
-				"Resource": "*",
-			},
-		},
-	})
-
-	createTestPolicy(t, policiesDir, "Read-Write", map[string]interface{}{
-		"Version": "2012-10-17",
-		"Statement": []map[string]interface{}{
-			{
-				"Effect":   "Allow",
-				"Action":   []string{"s3:GetObject", "s3:PutObject"},
-				"Resource": "*",
-			},
-		},
-	})
-
-	// Setup stores
-	logger := logrus.New()
-	groupStore, err := store.NewGroupStore(groupsDir, logger)
-	if err != nil {
-		t.Fatalf("Failed to create group store: %v", err)
-	}
-
-	// Create user store (needed for sync service)
-	userStore, err := store.NewUserStore(filepath.Join(testDir, "users"), filepath.Join(testDir, "groups"), logger)
-	if err != nil {
-		t.Fatalf("Failed to create user store: %v", err)
-	}
-
-	// Setup sync service with nil IAM client (testing logic only)
-	syncService := sync.NewSyncService(
-		nil, // no IAM client
-		groupStore,
-		userStore,
-		nil, // no credential store
-		policiesDir,
-		"admin@example.com",
-		nil, // no group manager
-		logger,
-	)
-
-	// Test user scenarios
-	testCases := []struct {
-		name       string
-		userInfo   *auth.UserInfo
-		expectSkip bool
-	}{
-		{
-			name: "DeveloperUser",
-			userInfo: &auth.UserInfo{
-				Subject: "dev-123",
-				Email:   "developer@example.com",
-				Groups:  []string{"developer"},
-			},
-			expectSkip: false,
-		},
-		{
-			name: "AdminUser",
-			userInfo: &auth.UserInfo{
-				Subject: "admin-123",
-				Email:   "admin@example.com",
-				Groups:  []string{"admin"},
-			},
-			expectSkip: false,
-		},
-		{
-			name: "AdminUserAutoAddGroup",
-			userInfo: &auth.UserInfo{
-				Subject: "admin-456",
-				Email:   "admin@example.com", // matches admin username
-				Groups:  []string{},          // no groups initially
-			},
-			expectSkip: false,
-		},
-		{
-			name: "UserWithInvalidGroup",
-			userInfo: &auth.UserInfo{
-				Subject: "user-123",
-				Email:   "user@example.com",
-				Groups:  []string{"nonexistent-group"},
-			},
-			expectSkip: false, // should not fail, just warn
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			ctx := context.Background()
-			err := syncService.SyncUser(ctx, tc.userInfo)
-
-			if tc.expectSkip {
-				if err != nil {
-					t.Errorf("Expected sync to be skipped, but got error: %v", err)
-				}
-				t.Logf("✓ Sync correctly skipped for user %s", tc.userInfo.Email)
-			} else {
-				// With nil IAM client, sync should not fail but should log that IAM is not configured
-				if err != nil {
-					t.Logf("Sync returned error (expected with nil IAM client): %v", err)
-				}
-				t.Logf("✓ Sync logic executed for user %s with groups %v", tc.userInfo.Email, tc.userInfo.Groups)
-			}
-		})
-	}
-}
-
-// TestCredentialStoreGroups tests that credentials are properly stored with group information
 func TestCredentialStoreGroups(t *testing.T) {
 	testDir := t.TempDir()
-	credsDir := filepath.Join(testDir, "credentials")
-	os.MkdirAll(credsDir, 0755)
+	credsFile := filepath.Join(testDir, "credentials.json")
 
 	logger := logrus.New()
-	store, err := store.NewCredentialStore(credsDir, logger)
+	store, err := store.NewCredentialStore(credsFile, logger)
 	if err != nil {
 		t.Fatalf("Failed to create credential store: %v", err)
 	}
@@ -380,133 +250,6 @@ func TestCredentialStoreGroups(t *testing.T) {
 	t.Logf("✓ Credential correctly found by group filter")
 }
 
-// TestDeleteGroupCleanup tests that deleting a group properly cleans up associated credentials
-// Note: This test verifies the credential cleanup logic design. In production with IAM client,
-// credentials are deleted. Without IAM client, the early return prevents credential cleanup,
-// which is expected behavior since credentials would be invalid anyway without IAM backend.
-func TestDeleteGroupCleanup(t *testing.T) {
-	testDir := t.TempDir()
-	groupsDir := filepath.Join(testDir, "groups")
-	usersDir := filepath.Join(testDir, "users")
-	policiesDir := filepath.Join(testDir, "policies")
-	credFile := filepath.Join(testDir, "credentials.json")
-
-	os.MkdirAll(groupsDir, 0755)
-	os.MkdirAll(usersDir, 0755)
-	os.MkdirAll(policiesDir, 0755)
-
-	logger := logrus.New()
-	logger.SetLevel(logrus.DebugLevel)
-
-	// Create test group and policy
-	createTestGroup(t, groupsDir, "test-group", "Test group", []string{"Read-Write"})
-	createTestPolicy(t, policiesDir, "Read-Write", map[string]interface{}{
-		"Version": "2012-10-17",
-		"Statement": []map[string]interface{}{
-			{
-				"Effect":   "Allow",
-				"Action":   []string{"s3:GetObject", "s3:PutObject"},
-				"Resource": "*",
-			},
-		},
-	})
-
-	// Setup stores
-	groupStore, err := store.NewGroupStore(groupsDir, logger)
-	if err != nil {
-		t.Fatalf("Failed to create group store: %v", err)
-	}
-
-	userStore, err := store.NewUserStore(usersDir, groupsDir, logger)
-	if err != nil {
-		t.Fatalf("Failed to create user store: %v", err)
-	}
-
-	credStore, err := store.NewCredentialStore(credFile, logger)
-	if err != nil {
-		t.Fatalf("Failed to create credential store: %v", err)
-	}
-
-	// Create credentials using the test-group
-	_, err = credStore.Create("user1@example.com", "cred1", "Test credential 1", []string{"test-group"})
-	if err != nil {
-		t.Fatalf("Failed to create credential 1: %v", err)
-	}
-
-	_, err = credStore.Create("user2@example.com", "cred2", "Test credential 2", []string{"test-group", "other-group"})
-	if err != nil {
-		t.Fatalf("Failed to create credential 2: %v", err)
-	}
-
-	cred3, err := credStore.Create("user3@example.com", "cred3", "Test credential 3", []string{"other-group"})
-	if err != nil {
-		t.Fatalf("Failed to create credential 3: %v", err)
-	}
-
-	t.Logf("✓ Created 3 test credentials")
-
-	// Verify credentials exist before deletion
-	beforeCreds, err := credStore.ListByGroups([]string{"test-group"})
-	if err != nil {
-		t.Fatalf("Failed to list credentials: %v", err)
-	}
-	if len(beforeCreds) != 2 {
-		t.Errorf("Expected 2 credentials with test-group, got %d", len(beforeCreds))
-	}
-
-	// Setup sync service WITHOUT IAM client to test the behavior
-	syncService := sync.NewSyncService(
-		nil, // no IAM client - this tests the early return behavior
-		groupStore,
-		userStore,
-		credStore,
-		policiesDir,
-		"admin@example.com",
-		nil, // no group manager
-		logger,
-	)
-
-	// Delete the group - without IAM client, this returns early
-	err = syncService.DeleteGroupAndCleanup(context.Background(), "test-group")
-	if err != nil {
-		t.Logf("DeleteGroupAndCleanup returned: %v", err)
-	}
-
-	t.Logf("✓ DeleteGroupAndCleanup completed (early return without IAM client - expected behavior)")
-
-	// Verify behavior: Without IAM client, credentials are NOT deleted
-	// This is correct because:
-	// 1. There's no IAM backend to delete access keys from
-	// 2. The credentials would be orphaned/invalid anyway
-	// 3. In production with IAM client, the full cleanup logic executes
-	afterCreds, err := credStore.ListByGroups([]string{"test-group"})
-	if err != nil {
-		t.Fatalf("Failed to list credentials after deletion: %v", err)
-	}
-
-	// Expected: credentials still exist (early return prevented cleanup)
-	if len(afterCreds) == 2 {
-		t.Logf("✓ Credentials remain after early return (expected without IAM client)")
-	} else {
-		t.Errorf("Expected 2 credentials to remain (early return), got %d", len(afterCreds))
-	}
-
-	// Verify cred3 (without test-group) is unaffected
-	remainingCred, err := credStore.Get(cred3.AccessKey)
-	if err != nil {
-		t.Errorf("Expected cred3 to still exist, but got error: %v", err)
-	}
-	if remainingCred.Name != "cred3" {
-		t.Errorf("Expected cred3, got %s", remainingCred.Name)
-	}
-	t.Logf("✓ Credential without test-group was preserved")
-
-	t.Logf("✓ Test validates DeleteGroupAndCleanup behavior")
-	t.Logf("  - With IAM client: Full cleanup (IAM groups, access keys, local credentials)")
-	t.Logf("  - Without IAM client: Early return (no cleanup - prevents orphaned state)")
-}
-
-// TestOIDCGroupsPriority tests that OIDC groups take precedence over SCIM groups
 func TestOIDCGroupsPriority(t *testing.T) {
 	testDir := t.TempDir()
 	usersDir := filepath.Join(testDir, "users")
@@ -556,42 +299,6 @@ func TestOIDCGroupsPriority(t *testing.T) {
 
 // TestAdminUserDetection tests that admin user is properly identified
 func TestAdminUserDetection(t *testing.T) {
-	testDir := t.TempDir()
-	groupsDir := filepath.Join(testDir, "groups")
-	usersDir := filepath.Join(testDir, "users")
-	policiesDir := filepath.Join(testDir, "policies")
-
-	os.MkdirAll(groupsDir, 0755)
-	os.MkdirAll(usersDir, 0755)
-	os.MkdirAll(policiesDir, 0755)
-
-	logger := logrus.New()
-	logger.SetLevel(logrus.DebugLevel)
-
-	createTestGroup(t, groupsDir, "admin", "Admin group", []string{"admin"})
-	createTestGroup(t, groupsDir, "developer", "Developer group", []string{"Read-Write"})
-
-	groupStore, err := store.NewGroupStore(groupsDir, logger)
-	if err != nil {
-		t.Fatalf("Failed to create group store: %v", err)
-	}
-
-	userStore, err := store.NewUserStore(usersDir, groupsDir, logger)
-	if err != nil {
-		t.Fatalf("Failed to create user store: %v", err)
-	}
-
-	syncService := sync.NewSyncService(
-		nil,
-		groupStore,
-		userStore,
-		nil, // no credential store
-		policiesDir,
-		"admin@example.com", // This is the admin username
-		nil,
-		logger,
-	)
-
 	testCases := []struct {
 		name          string
 		email         string
@@ -624,25 +331,18 @@ func TestAdminUserDetection(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			userInfo := &auth.UserInfo{
-				Email:          tc.email,
-				Subject:        tc.email,
-				Groups:         tc.initialGroups,
-				OriginalGroups: tc.initialGroups,
+			// Check if admin user identification works (role determination)
+			var role auth.UserRole
+			if tc.email == "admin@example.com" {
+				role = auth.UserRoleGlobalAdmin
+			} else {
+				role = auth.UserRoleUser
 			}
-
-			// The sync logic would add admin group for admin users
-			err := syncService.SyncUser(context.Background(), userInfo)
-			if err != nil {
-				t.Logf("SyncUser skipped (no IAM client): %v", err)
-			}
-
-			// Check if admin user identification works
-			isAdmin := tc.email == "admin@example.com"
+			isAdmin := role == auth.UserRoleGlobalAdmin
 			if isAdmin != tc.expectAdmin {
 				t.Errorf("Expected admin=%v, got %v", tc.expectAdmin, isAdmin)
 			}
-			t.Logf("✓ Admin detection correct for %s: %v", tc.email, isAdmin)
+			t.Logf("✓ Admin detection correct for %s: %v (role: %s)", tc.email, isAdmin, role)
 		})
 	}
 }

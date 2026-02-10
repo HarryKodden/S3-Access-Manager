@@ -32,30 +32,30 @@ type AccessKeyInfo struct {
 }
 
 // NewIAMClient creates a new IAM client with IAM-specific credentials
-func NewIAMClient(cfg config.S3Config, logger *logrus.Logger) (*IAMClient, error) {
+func NewIAMClient(s3Cfg config.S3GlobalConfig, iamCfg config.IAMConfig, logger *logrus.Logger) (*IAMClient, error) {
 	ctx := context.Background()
 
 	accessPrefix := ""
-	if len(cfg.IAM.AccessKey) > 5 {
-		accessPrefix = cfg.IAM.AccessKey[:5]
-	} else if len(cfg.IAM.AccessKey) > 0 {
-		accessPrefix = cfg.IAM.AccessKey
+	if len(iamCfg.AccessKey) > 5 {
+		accessPrefix = iamCfg.AccessKey[:5]
+	} else if len(iamCfg.AccessKey) > 0 {
+		accessPrefix = iamCfg.AccessKey
 	}
 
 	logger.WithFields(logrus.Fields{
-		"endpoint":      cfg.Endpoint,
-		"region":        cfg.Region,
-		"has_access":    cfg.IAM.AccessKey != "",
-		"has_secret":    cfg.IAM.SecretKey != "",
+		"endpoint":      s3Cfg.Endpoint,
+		"region":        s3Cfg.Region,
+		"has_access":    iamCfg.AccessKey != "",
+		"has_secret":    iamCfg.SecretKey != "",
 		"access_prefix": accessPrefix,
 	}).Info("Initializing IAM client")
 
 	// Create AWS config with IAM credentials
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx,
-		awsconfig.WithRegion(cfg.Region),
+		awsconfig.WithRegion(s3Cfg.Region),
 		awsconfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			cfg.IAM.AccessKey,
-			cfg.IAM.SecretKey,
+			iamCfg.AccessKey,
+			iamCfg.SecretKey,
 			"",
 		)),
 	)
@@ -65,8 +65,8 @@ func NewIAMClient(cfg config.S3Config, logger *logrus.Logger) (*IAMClient, error
 
 	// Create IAM client with custom endpoint resolver for Ceph/MinIO
 	iamClient := iam.NewFromConfig(awsCfg, func(o *iam.Options) {
-		if cfg.Endpoint != "" {
-			o.BaseEndpoint = aws.String(cfg.Endpoint)
+		if s3Cfg.Endpoint != "" {
+			o.BaseEndpoint = aws.String(s3Cfg.Endpoint)
 			// Disable HTTPS requirement if needed
 			o.EndpointOptions.DisableHTTPS = false
 		}
@@ -92,9 +92,9 @@ func NewIAMClient(cfg config.S3Config, logger *logrus.Logger) (*IAMClient, error
 
 	// Create STS client with same configuration
 	stsClient := sts.NewFromConfig(awsCfg, func(o *sts.Options) {
-		if cfg.Endpoint != "" {
+		if s3Cfg.Endpoint != "" {
 			// For Ceph/MinIO, STS operations use the same endpoint as S3
-			o.BaseEndpoint = aws.String(cfg.Endpoint)
+			o.BaseEndpoint = aws.String(s3Cfg.Endpoint)
 			o.EndpointOptions.DisableHTTPS = false
 		}
 	})

@@ -1,12 +1,10 @@
 package handler
 
 import (
-	"context"
 	"net/http"
 
 	"github.com/harrykodden/s3-gateway/internal/auth"
 	"github.com/harrykodden/s3-gateway/internal/store"
-	"github.com/harrykodden/s3-gateway/internal/sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
@@ -192,26 +190,13 @@ func (h *PolicyHandler) UpdatePolicy(c *gin.Context) {
 	}).Info("Policy updated")
 
 	// Sync affected groups - find all groups using this policy and update their IAM policies
-	if h.groupStore != nil && h.syncService != nil {
+	if h.groupStore != nil {
 		affectedGroups := h.groupStore.GetGroupsUsingPolicy(name)
 		if len(affectedGroups) > 0 {
 			h.logger.WithFields(logrus.Fields{
 				"policy":          name,
 				"affected_groups": len(affectedGroups),
-			}).Info("Syncing groups affected by policy update")
-
-			if syncSvc, ok := h.syncService.(*sync.SyncService); ok {
-				for _, group := range affectedGroups {
-					groupId := group.ScimGroupId
-					go func(gid string) {
-						if err := syncSvc.SyncGroupPolicy(context.Background(), gid); err != nil {
-							h.logger.WithError(err).WithField("group", gid).Error("Failed to sync group policy after policy update")
-						} else {
-							h.logger.WithField("group", gid).Info("Group policy synced after policy update")
-						}
-					}(groupId)
-				}
-			}
+			}).Info("Policy updated - file watcher will trigger full sync")
 		}
 	}
 
@@ -299,18 +284,12 @@ func (h *PolicyHandler) getUserInfo(c *gin.Context) *auth.UserInfo {
 	return userInfo
 }
 
-// isAdmin checks if the user has admin role
+// isAdmin checks if the user has admin role (global admin or tenant admin)
 func (h *PolicyHandler) isAdmin(c *gin.Context) bool {
 	userInfo := h.getUserInfo(c)
 	if userInfo == nil {
 		return false
 	}
 
-	for _, group := range userInfo.Groups {
-		if group == "admin" {
-			return true
-		}
-	}
-
-	return false
+	return userInfo.Role == auth.UserRoleGlobalAdmin || userInfo.Role == auth.UserRoleTenantAdmin
 }

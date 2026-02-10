@@ -41,12 +41,61 @@
             </div>
         </div>
 
+        <!-- Tenant Selection Screen -->
+        <div id="tenant-selection-screen" class="screen">
+            <div class="login-container">
+                <div class="logo">
+                    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                        <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
+                        <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
+                        <line x1="12" y1="22.08" x2="12" y2="12"></line>
+                    </svg>
+                </div>
+                <h1>Select Tenant</h1>
+                <p class="subtitle">Choose a tenant to manage</p>
+                
+                <div class="create-tenant-section">
+                    <button id="create-tenant-btn" class="btn btn-secondary" onclick="showCreateTenantForm()">
+                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                            <path d="M12 5v14M5 12h14"/>
+                        </svg>
+                        Create New Tenant
+                    </button>
+                    
+                    <div id="create-tenant-form" class="create-tenant-form" style="display: none;">
+                        <input type="text" id="new-tenant-name" placeholder="Tenant Name" maxlength="50" required />
+                        <input type="text" id="new-tenant-description" placeholder="Description (optional)" />
+                        <textarea id="new-tenant-admin-emails" placeholder="Admin Emails (one per line, at least one required)" rows="3" required></textarea>
+                        <div class="form-hint">IAM credentials are optional - you can add them later</div>
+                        <input type="text" id="new-tenant-iam-access-key" placeholder="IAM Access Key (optional)" />
+                        <input type="password" id="new-tenant-iam-secret-key" placeholder="IAM Secret Key (optional)" />
+                        <div class="form-actions">
+                            <button class="btn btn-primary" onclick="createTenant()">Create</button>
+                            <button class="btn btn-secondary" onclick="hideCreateTenantForm()">Cancel</button>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="tenant-list" id="tenant-list">
+                    <!-- Tenants will be loaded here -->
+                </div>
+            </div>
+        </div>
+
         <!-- Main Dashboard -->
         <div id="dashboard-screen" class="screen">
             <!-- Header -->
             <header class="header">
                 <div class="header-left">
-                    <h2>S3 Access Manager</h2>
+                    <h2 id="app-title">S3 Access Manager</h2>
+                    <div class="tenant-switcher" id="tenant-switcher" style="display: none;">
+                        <span id="tenant-name" class="tenant-name-badge" onclick="toggleTenantDropdown()" title="Click to switch tenant"></span>
+                        <div id="tenant-dropdown" class="tenant-dropdown" style="display: none;"></div>
+                    </div>
+                    <div class="health-indicator" id="health-indicator" title="System Health">
+                        <span class="health-dot"></span>
+                        <span class="health-text">Checking...</span>
+                    </div>
                 </div>
                 <div class="header-right">
                     <span class="user-info" id="user-info"></span>
@@ -78,7 +127,7 @@
                         </svg>
                         Credentials
                     </button>
-                    <button class="tab admin-only"  data-tab="policies">
+                    <button class="tab tenant-admin-only" data-tab="policies" style="display: none;">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
                             <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
                             <polyline points="14 2 14 8 20 8"></polyline>
@@ -88,7 +137,7 @@
                         </svg>
                         Policies
                     </button>
-                    <button class="tab admin-only"  data-tab="roles">
+                    <button class="tab tenant-admin-only" data-tab="roles" style="display: none;">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
                             <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
                             <circle cx="9" cy="7" r="4"></circle>
@@ -98,15 +147,14 @@
                         </svg>
                         Roles
                     </button>
-                    <!-- <button class="tab admin-only" data-tab="users" style="display: none;">
+                    <button class="tab global-admin-only" data-tab="tenants" style="display: none;">
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
-                            <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
-                            <circle cx="9" cy="7" r="4"></circle>
-                            <path d="M23 21v-2a4 4 0 0 0-3-3.87"></path>
-                            <path d="M16 3.13a4 4 0 0 1 0 7.75"></path>
+                            <path d="M3 7v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2z"></path>
+                            <path d="M8 5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2H8V5z"></path>
+                            <line x1="12" y1="12" x2="12" y2="12"></line>
                         </svg>
-                        Users
-                    </button> -->
+                        Tenants
+                    </button>
                 </nav>
 
                 <!-- Tab Contents -->
@@ -116,7 +164,7 @@
                         <div class="panel-header">
                             <h3>S3 Credentials</h3>
                             <div style="display: flex; gap: 0.5rem;">
-                                <button id="update-credentials-btn" class="btn btn-secondary btn-sm admin-only" title="Update All Credentials" style="display: none;">
+                                <button id="update-credentials-btn" class="btn btn-secondary btn-sm tenant-admin-only" title="Update All Credentials" style="display: none;">
                                     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" style="vertical-align: middle; margin-right: 0.25rem;">
                                         <path d="M21.5 2v6h-6M21.5 2l-6 6M2.5 22v-6h6M2.5 22l6-6M16 9.5A6.5 6.5 0 1 1 9.5 16c1.61 0 3.09-.59 4.23-1.57"></path>
                                         <path d="M9.5 16V9.5l4 2.25"></path>
@@ -140,7 +188,7 @@
                     <div id="policies-tab" class="tab-panel">
                         <div class="panel-header">
                             <h3>Access Policies</h3>
-                            <button class="btn-icon admin-only" onclick="showCreatePolicyModal()" title="New Policy" style="width: auto; padding: 0.5rem 0.75rem;">
+                            <button class="btn-icon tenant-admin-only" onclick="showCreatePolicyModal()" title="New Policy" style="width: auto; padding: 0.5rem 0.75rem;">
                                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                     <line x1="12" y1="5" x2="12" y2="19"></line>
                                     <line x1="5" y1="12" x2="19" y2="12"></line>
@@ -156,7 +204,7 @@
                     <div id="roles-tab" class="tab-panel">
                         <div class="panel-header">
                             <h3>Roles</h3>
-                            <button class="btn-icon admin-only" onclick="showCreateGroupModal()" title="New Group" style="width: auto; padding: 0.5rem 0.75rem;">
+                            <button class="btn-icon tenant-admin-only" onclick="showCreateGroupModal()" title="New Group" style="width: auto; padding: 0.5rem 0.75rem;">
                                 <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                                     <line x1="12" y1="5" x2="12" y2="19"></line>
                                     <line x1="5" y1="12" x2="19" y2="12"></line>
@@ -165,6 +213,22 @@
                         </div>
                         <div id="roles-list" class="roles-list">
                             <!-- Roles will be displayed here -->
+                        </div>
+                    </div>
+
+                    <!-- Tenants Tab -->
+                    <div id="tenants-tab" class="tab-panel">
+                        <div class="panel-header">
+                            <h3>Tenants</h3>
+                            <button class="btn-icon global-admin-only" onclick="showCreateTenantModal()" title="New Tenant" style="width: auto; padding: 0.5rem 0.75rem;">
+                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                                </svg>
+                            </button>
+                        </div>
+                        <div id="tenants-list" class="tenants-list">
+                            <!-- Tenants will be displayed here -->
                         </div>
                     </div>
 
@@ -297,37 +361,147 @@
         </div>
     </div>
 
-    <!-- Create/Edit Group Modal -->
+    <!-- Create/Edit Role Modal -->
     <div id="group-modal" class="modal">
-        <div class="modal-content" style="max-width: 700px;">
+        <div class="modal-content" style="max-width: 600px;">
             <div class="modal-header">
                 <h3 id="group-modal-title">Create New Role</h3>
                 <button class="modal-close">&times;</button>
             </div>
             <div class="modal-body">
                 <div class="form-group">
-                    <label for="group-name-select">SCIM Group Name</label>
-                    <input type="text" id="group-name" placeholder="admin" style="display: none;" />
+                    <label for="group-name-select">SRAM Group</label>
                     <select id="group-name-select" style="width: 100%; padding: 0.5rem; border: 1px solid var(--border-color); border-radius: 4px; background: var(--bg-color); color: var(--text-color);">
-                        <option value="">-- Select a SCIM group --</option>
+                        <option value="">-- Select an SRAM group --</option>
                     </select>
-                    <small>Roles are mapped to SCIM groups. SCIM groups must be provisioned first.</small>
+                    <small style="color: var(--text-secondary);">Select the SRAM group to create a role for</small>
                 </div>
                 <div class="form-group">
                     <label for="group-description">Description (optional)</label>
-                    <input type="text" id="group-description" placeholder="Administrator with full access" />
+                    <input type="text" id="group-description" placeholder="Purpose of this role" />
                 </div>
                 <div class="form-group">
-                    <label>Assigned Policies</label>
-                    <div id="group-policies-selector" class="policies-selector" style="border: 1px solid var(--border-color); border-radius: 4px; padding: 0.75rem; max-height: 300px; overflow-y: auto;">
-                        <!-- Policy checkboxes will be loaded here -->
+                    <label>Attach Policies</label>
+                    <div id="group-policies-selector" style="max-height: 300px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 4px; padding: 0.5rem;">
+                        <!-- Policy checkboxes will be added here -->
                     </div>
-                    <small>Select one or more policies to assign to this group. At least one policy is required.</small>
+                    <small style="color: var(--text-secondary);">Select one or more policies to attach to this role</small>
                 </div>
             </div>
             <div class="modal-footer">
                 <button class="btn btn-secondary modal-cancel">Cancel</button>
-                <button class="btn btn-primary" id="confirm-save-group">Save Group</button>
+                <button class="btn btn-primary" onclick="saveRole()">Save Role</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Create/Edit Tenant Modal -->
+    <div id="tenant-modal" class="modal">
+        <div class="modal-content" style="max-width: 600px;">
+            <div class="modal-header">
+                <h3 id="tenant-modal-title">Create New Tenant</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label for="tenant-modal-name">Tenant Name</label>
+                    <input type="text" id="tenant-modal-name" placeholder="my-tenant" maxlength="50" />
+                </div>
+                <div class="form-group">
+                    <label for="tenant-description">Description (optional)</label>
+                    <input type="text" id="tenant-description" placeholder="Purpose of this tenant" />
+                </div>
+                <div class="form-group">
+                    <label for="tenant-admin-email">Admin Emails</label>
+                    <input type="text" id="tenant-admin-email" placeholder="enter administrator email(s)" required />
+                    <small class="form-hint">Admin emails for this tenant (space-separated)</small>
+                </div>
+                <div class="form-group">
+                    <label>Tenant Admin Emails</label>
+                    <div id="tenant-admin-emails-display" class="admin-emails-list"></div>
+                    <small class="form-hint">Admin emails are managed during tenant creation and via SRAM invitations</small>
+                </div>
+                <div class="form-hint">IAM credentials are optional - you can add them later</div>
+                <div class="form-group">
+                    <label for="tenant-iam-access-key">IAM Access Key (optional)</label>
+                    <input type="text" id="tenant-iam-access-key" placeholder="AKIA... (leave empty to keep existing)" />
+                </div>
+                <div class="form-group">
+                    <label for="tenant-iam-secret-key">IAM Secret Key (optional)</label>
+                    <input type="password" id="tenant-iam-secret-key" placeholder="(leave empty to keep existing)" />
+                    <div id="tenant-iam-current-value" class="form-hint" style="margin-top: 5px;"></div>
+                </div>
+                <div id="sram-invitations-section" style="display: none;">
+                    <hr style="margin: 20px 0;">
+                    <h4>SRAM Admin Invitations</h4>
+                    <div id="sram-invitations-list" class="invitations-list"></div>
+                    <div style="display: flex; gap: 10px; margin-top: 10px;">
+                        <button type="button" class="btn btn-secondary" id="refresh-invitations" onclick="refreshInvitationStatus()">
+                            Refresh Status
+                        </button>
+                        <button type="button" class="btn btn-primary" id="sync-sram-admins" onclick="syncSRAMAdmins()">
+                            Sync Accepted Admins to Config
+                        </button>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary modal-cancel">Cancel</button>
+                <button class="btn btn-primary" id="confirm-save-tenant" onclick="handleSaveTenant()">Create Tenant</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Inspect Tenant Modal -->
+    <div id="inspect-tenant-modal" class="modal">
+        <div class="modal-content" style="max-width: 700px;">
+            <div class="modal-header">
+                <h3>Tenant Details</h3>
+                <button class="modal-close">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>Tenant Name</label>
+                    <div id="inspect-tenant-name" style="font-weight: 600;"></div>
+                </div>
+                <div class="form-group">
+                    <label>Description</label>
+                    <div id="inspect-tenant-description"></div>
+                </div>
+                <div class="form-group">
+                    <label>Admin Email</label>
+                    <div id="inspect-tenant-admin-email"></div>
+                </div>
+                <div class="form-group">
+                    <label>IAM Access Key</label>
+                    <div id="inspect-tenant-iam-access-key" style="font-family: monospace;"></div>
+                </div>
+                <div class="form-group">
+                    <label>IAM Secret Key</label>
+                    <div style="display: flex; align-items: center; gap: 0.5rem;">
+                        <div id="inspect-tenant-iam-secret-key" style="font-family: monospace; flex: 1;">••••••••••••••••</div>
+                        <button id="toggle-tenant-secret-visibility" class="btn-icon" title="Toggle visibility" onclick="toggleTenantSecretKeyVisibility()">
+                            <svg id="tenant-secret-eye-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                                <circle cx="12" cy="12" r="3"></circle>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Status</label>
+                    <div id="inspect-tenant-status" class="status-badge">Active</div>
+                </div>
+                <div class="form-group">
+                    <label>SRAM Invitation Status</label>
+                    <div id="sram-invitation-status">
+                        <p class="text-muted">Loading...</p>
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary modal-close">Close</button>
+                <button class="btn btn-primary" id="edit-tenant-btn">Edit Tenant</button>
             </div>
         </div>
     </div>

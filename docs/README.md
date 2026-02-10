@@ -8,6 +8,21 @@
 - **[OIDC Authentication](OIDC_AUTHENTICATION.md)** - Authentication setup
 - **[Policies](POLICIES.md)** - IAM policy configuration
 - **[Secure Config](SECURE_CONFIG.md)** - Security best practices
+- **[Multi-Tenant Setup](TENANTS.md)** - Multi-tenant configuration guide
+
+## Directory Structure
+
+```
+./data/
+├── scim/                    # Global SCIM data (shared across all tenants)
+│   ├── Users/              # SCIM user provisioning
+│   └── Groups/             # SCIM group provisioning
+└── tenants/                # Tenant-specific data
+    └── {tenant-name}/      # Per-tenant directory
+        ├── config.yaml     # Tenant configuration
+        ├── policies/       # Tenant-specific policies
+        └── roles/          # Tenant-specific roles
+```
 
 ## Getting Started
 

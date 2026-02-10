@@ -1,53 +1,156 @@
-# RBAC Implementation - Admin vs User Access Control
+# RBAC Implementation - Multi-Level Access Control
 
 ## Overview
 
-This document describes the implementation of Role-Based Access Control (RBAC) to differentiate between ADMIN and USER roles in the S3 Access Manager.
+This document describes the implementation of Role-Based Access Control (RBAC) with three distinct user roles in the S3 Access Manager: **Global Administrators**, **Tenant Administrators**, and **Normal Users**.
+
+## User Roles
+
+### 1. Global Administrators
+- **Configuration**: Listed in `config.yaml` under `global_admins`
+- **Permissions**:
+  - Full system access across all tenants
+  - Create, modify, and delete tenants
+  - Manage global OIDC/SCIM configuration
+  - Access all tenant-specific resources
+  - Perform any administrative operation
+
+### 2. Tenant Administrators
+- **Configuration**: Listed in tenant config under `tenant_admins`
+- **Permissions**:
+  - Administrative access within their specific tenant
+  - Manage users, groups, policies, and roles for their tenant
+  - Create and manage S3 credentials for tenant users
+  - Cannot access other tenants or global configuration
+
+### 3. Normal Users
+- **Configuration**: Any authenticated user not in admin lists
+- **Permissions**:
+  - Create S3 credentials for groups they belong to
+  - Access S3 resources based on their group policies
+  - Cannot perform administrative operations
 
 ## Changes Implemented
 
 ### 1. Backend Authentication Layer
 
 #### **internal/auth/oidc.go**
-- **Added `IsAdmin` field to `UserInfo` struct**: Tracks whether a user has admin privileges
-- **Set admin flag during authentication**: The `isAdminUser()` function checks if the authenticated user is in the admin users list (configured in `config.yaml` under `admin.username`)
-- **Admin users get expanded groups**: Admin users automatically get all policy names added to their groups for full system access
+- **Replaced `IsAdmin` with `Role` field**: `UserInfo` struct now contains a `UserRole` enum
+- **Role determination during authentication**: `determineUserRole()` function checks global and tenant admin lists
+- **Admin users get expanded groups**: Admin users automatically get all policy names added to their groups
 
 ```go
+type UserRole string
+
+const (
+    UserRoleGlobalAdmin UserRole = "global_admin"
+    UserRoleTenantAdmin UserRole = "tenant_admin"
+    UserRoleUser        UserRole = "user"
+)
+
 type UserInfo struct {
     Subject        string
     Email          string
     Groups         []string // Effective groups (includes all policies for admin users)
     OriginalGroups []string // Original OIDC groups (before policy expansion)
-    IsAdmin        bool     // True if user is an admin
+    Role           UserRole // User's role: global_admin, tenant_admin, or user
     Claims         map[string]interface{}
 }
 ```
 
 #### **internal/middleware/auth.go**
-- **Added `RequireAdmin()` middleware**: New middleware function that checks if a user has admin privileges
-- **Returns 403 Forbidden**: Non-admin users attempting to access admin endpoints get a clear error message
+- **Updated `RequireAdmin()` middleware**: Now checks for `UserRoleGlobalAdmin` role
+- **Returns 403 Forbidden**: Non-global-admin users attempting to access global admin endpoints get a clear error message
 
 ```go
 func RequireAdmin(logger *logrus.Logger) gin.HandlerFunc {
-    // Checks userInfo.IsAdmin flag
-    // Returns 403 if not admin
+    // Checks userInfo.Role == UserRoleGlobalAdmin
+    // Returns 403 if not global admin
 }
 ```
 
 #### **cmd/gateway/main.go**
-- **Protected admin endpoints**: Applied `adminMiddleware` to all policy, role, and user management endpoints
-- **Admin-only operations**:
-  - **Policies**: GET, POST, PUT, DELETE (all policy management)
-  - **Roles**: GET, POST, PUT, DELETE (all role management)
-  - **Users**: GET, DELETE (all user management)
-  - **SCIM Groups**: GET (viewing available SCIM groups)
+- **Role-based endpoint protection**: Applied appropriate middleware based on required access level
+- **Global Admin Operations** (RequireAdmin middleware):
+  - Tenant management endpoints
+  - Global configuration endpoints
+- **Admin Operations** (Tenant Admin + Global Admin):
+  - Policy management within tenant
+  - User management within tenant
+  - Group management within tenant
+  - Credential management within tenant
 
-```go
-// ADMIN ONLY - Policy management
-settingsRoutes.GET("/policies", adminMiddleware, policyHandler.ListPolicies)
-settingsRoutes.POST("/policies", adminMiddleware, policyHandler.CreatePolicy)
-settingsRoutes.PUT("/policies/:name", adminMiddleware, policyHandler.UpdatePolicy)
+### 2. Handler Updates
+
+#### **internal/handler/policies.go**
+- **Updated `isAdmin()` method**: Now checks for both global and tenant admin roles
+- **Allows tenant admins to manage policies**: Within their tenant scope
+
+#### **internal/handler/users.go**
+- **Updated admin checks**: Uses role-based checks instead of email comparison
+- **Tenant admin access**: Can manage users within their tenant
+
+#### **internal/handler/credentials.go**
+- **Role-based credential creation**: Admins can create credentials for any group, users only for their groups
+- **Updated API response**: `is_admin` flag returns true for both admin role types
+
+### 3. Configuration Structure
+
+#### **config.yaml** (Global)
+```yaml
+# Global administrators with full system access
+global_admins:
+  - "admin@example.com"
+```
+
+#### **data/<tenant>/config.yaml** (Tenant)
+```yaml
+# Tenant administrators with tenant-level admin access
+tenant_admins:
+  - "admin@tenant.com"
+```
+
+## Security Model
+
+### Access Control Matrix
+
+| Operation | Global Admin | Tenant Admin | Normal User |
+|-----------|-------------|--------------|-------------|
+| Create Tenant | ✅ | ❌ | ❌ |
+| Delete Tenant | ✅ | ❌ | ❌ |
+| Modify Global Config | ✅ | ❌ | ❌ |
+| Manage Tenant Policies | ✅ | ✅ (own tenant) | ❌ |
+| Manage Tenant Users | ✅ | ✅ (own tenant) | ❌ |
+| Create Credentials | ✅ | ✅ (own tenant) | ✅ (own groups) |
+| Access S3 Resources | ✅ | ✅ | ✅ (per policy) |
+
+### Authentication Flow
+
+1. **OIDC Authentication**: User authenticates via external OIDC provider
+2. **Role Determination**:
+   - Check if user email is in `global_admins` → Global Admin
+   - Check if user email is in tenant's `tenant_admins` → Tenant Admin
+   - Default → Normal User
+3. **Group Expansion**: Admin users get all policy names added to their groups
+4. **Request Processing**: Middleware and handlers check appropriate role levels
+5. **Access Granted/Denied**: Based on role and operation requirements
+
+## Benefits
+
+✅ **Hierarchical Access Control**: Clear separation between global and tenant administration
+✅ **Multi-Tenant Security**: Tenant admins cannot access other tenants
+✅ **Flexible Configuration**: Easy to add/remove admins via configuration files
+✅ **Backward Compatibility**: Existing API responses maintained
+✅ **Scalable**: Supports complex enterprise deployments with multiple tenants
+
+## Migration from Single Admin Flag
+
+The previous implementation used a simple `IsAdmin` boolean flag. The new system provides:
+
+- **Granular Control**: Three distinct role levels instead of binary admin/user
+- **Multi-Tenant Support**: Proper isolation between tenant administrators
+- **Configuration-Driven**: Admin roles defined in configuration files
+- **Future-Proof**: Extensible role system for additional role types
 settingsRoutes.DELETE("/policies/:name", adminMiddleware, policyHandler.DeletePolicy)
 
 // ADMIN ONLY - Role management

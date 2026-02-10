@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/harrykodden/s3-gateway/internal/backend"
 	"github.com/sirupsen/logrus"
@@ -20,6 +21,7 @@ type Client struct {
 	callerArn string
 	accessKey string
 	secretKey string
+	profile   string
 }
 
 // UserInfo contains basic IAM user information
@@ -226,8 +228,50 @@ func (c *Client) removeProfileFromFile(filePath, profileName string) error {
 	return nil
 }
 
+func sanitizeProfileName(tenantName string) string {
+	name := strings.ToLower(strings.TrimSpace(tenantName))
+	if name == "" {
+		return ""
+	}
+	name = strings.ReplaceAll(name, " ", "-")
+	name = strings.ReplaceAll(name, "_", "-")
+	for _, char := range []string{".", ",", "!", "@", "#", "$", "%", "^", "&", "*", "(", ")", "+", "=", "[", "]", "{", "}", "|", "\\", ":", ";", "\"", "'", "<", ">", "?", "/"} {
+		name = strings.ReplaceAll(name, char, "")
+	}
+	return name
+}
+
+func removeProfileSection(content, profileName string) string {
+	if content == "" {
+		return ""
+	}
+	lines := strings.Split(content, "\n")
+	var newLines []string
+	inProfile := false
+	for _, line := range lines {
+		if strings.HasPrefix(line, fmt.Sprintf("[%s]", profileName)) || strings.HasPrefix(line, fmt.Sprintf("[profile %s]", profileName)) {
+			inProfile = true
+			continue
+		}
+		if inProfile {
+			if strings.HasPrefix(line, "[") {
+				inProfile = false
+			} else {
+				continue
+			}
+		}
+		newLines = append(newLines, line)
+	}
+	cleaned := strings.Join(newLines, "\n")
+	cleaned = strings.TrimRight(cleaned, "\n")
+	if cleaned != "" {
+		cleaned += "\n"
+	}
+	return cleaned
+}
+
 // NewClient creates a new AWS CLI client and sets up AWS config files
-func NewClient(endpoint, accessKey, secretKey, region string, logger *logrus.Logger) (*Client, error) {
+func NewClient(endpoint, accessKey, secretKey, region, tenantName string, logger *logrus.Logger) (*Client, error) {
 	// Set up AWS config directory
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
@@ -239,28 +283,41 @@ func NewClient(endpoint, accessKey, secretKey, region string, logger *logrus.Log
 		return nil, fmt.Errorf("failed to create .aws directory: %w", err)
 	}
 
-	// Create ~/.aws/config
-	configContent := fmt.Sprintf(`[default]
+	profileName := sanitizeProfileName(tenantName)
+	if profileName == "" {
+		return nil, fmt.Errorf("invalid tenant name for AWS profile")
+	}
+
+	// Create ~/.aws/config (append or replace profile)
+	configPath := filepath.Join(awsDir, "config")
+	configContent := fmt.Sprintf(`[profile %s]
 region = %s
 endpoint_url = %s
 signature_version = s3v4
 payload_signing_enabled = true
 addressing_style = path
-`, region, endpoint)
-
-	configPath := filepath.Join(awsDir, "config")
-	if err := os.WriteFile(configPath, []byte(configContent), 0600); err != nil {
+`, profileName, region, endpoint)
+	configExisting, err := os.ReadFile(configPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("failed to read AWS config: %w", err)
+	}
+	configMerged := removeProfileSection(string(configExisting), profileName) + configContent
+	if err := os.WriteFile(configPath, []byte(configMerged), 0600); err != nil {
 		return nil, fmt.Errorf("failed to write AWS config: %w", err)
 	}
 
-	// Create ~/.aws/credentials
-	credContent := fmt.Sprintf(`[default]
+	// Create ~/.aws/credentials (append or replace profile)
+	credPath := filepath.Join(awsDir, "credentials")
+	credContent := fmt.Sprintf(`[%s]
 aws_access_key_id = %s
 aws_secret_access_key = %s
-`, accessKey, secretKey)
-
-	credPath := filepath.Join(awsDir, "credentials")
-	if err := os.WriteFile(credPath, []byte(credContent), 0600); err != nil {
+`, profileName, accessKey, secretKey)
+	credExisting, err := os.ReadFile(credPath)
+	if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("failed to read AWS credentials: %w", err)
+	}
+	credMerged := removeProfileSection(string(credExisting), profileName) + credContent
+	if err := os.WriteFile(credPath, []byte(credMerged), 0600); err != nil {
 		return nil, fmt.Errorf("failed to write AWS credentials: %w", err)
 	}
 
@@ -269,42 +326,18 @@ aws_secret_access_key = %s
 		"cred_path":   credPath,
 		"endpoint":    endpoint,
 		"region":      region,
+		"profile":     profileName,
 	}).Info("AWS CLI configuration created")
 
 	c := &Client{
 		logger:    logger,
 		accessKey: accessKey,
 		secretKey: secretKey,
+		profile:   profileName,
 	}
 
-	// Get caller identity
-	stdout, stderr, err := c.RunAwsCliCommand(logger, "sts", "get-caller-identity", "--output", "json")
-	if err != nil {
-		logger.WithFields(logrus.Fields{
-			"error":  err,
-			"stderr": string(stderr),
-		}).Warn("Failed to get caller identity, proceeding without account info")
-		c.accountID = ""
-		c.callerArn = ""
-	} else {
-		var identity struct {
-			Account string `json:"Account"`
-			Arn     string `json:"Arn"`
-		}
-		if err := json.Unmarshal(stdout, &identity); err != nil {
-			logger.WithError(err).Warn("Failed to parse caller identity")
-			c.accountID = ""
-			c.callerArn = ""
-		} else {
-			c.accountID = identity.Account
-			c.callerArn = identity.Arn
-
-			logger.WithFields(logrus.Fields{
-				"account_id": identity.Account,
-				"caller_arn": identity.Arn,
-			}).Info("Retrieved AWS account information")
-		}
-	}
+	// Skip blocking caller identity lookup during startup
+	logger.WithField("profile", profileName).Info("AWS CLI client initialized without caller identity lookup")
 
 	return c, nil
 }
@@ -317,8 +350,17 @@ func (c *Client) GetBackendType() string {
 // RunAwsCliCommand executes an AWS CLI command with logging
 func (c *Client) RunAwsCliCommand(logger *logrus.Logger, args ...string) ([]byte, []byte, error) {
 	logger.WithField("aws_cli_args", args).Info("Executing AWS CLI command")
-	cmd := exec.Command("aws", args...)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "aws", args...)
+	if c.profile != "" {
+		cmd.Env = append(os.Environ(), fmt.Sprintf("AWS_PROFILE=%s", c.profile))
+	}
 	stdout, err := cmd.Output()
+	if ctx.Err() == context.DeadlineExceeded {
+		logger.WithField("aws_cli_args", args).Error("AWS CLI command timed out")
+		return stdout, []byte("command timed out"), ctx.Err()
+	}
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			logger.WithFields(logrus.Fields{

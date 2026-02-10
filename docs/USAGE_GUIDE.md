@@ -18,12 +18,14 @@ The S3 Access Manager provides secure, policy-based access to Ceph S3 storage th
 
 ### 1. Login via OIDC
 
-1. Navigate to `http://localhost:9000` (or your gateway URL)
+1. Navigate to `http://localhost:9000/tenant/{tenant-name}/` (or your gateway URL with tenant prefix)
 2. Click **Sign In**
 3. Authenticate with your OIDC provider
 4. Your groups are automatically extracted from the OIDC token
 
 **Required:** Your OIDC token must include a `Groups` claim matching SCIM-provisioned groups.
+
+**Note:** For single-tenant deployments, you can also access `http://localhost:9000` directly.
 
 ### 2. Create S3 Credentials
 

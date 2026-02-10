@@ -63,14 +63,15 @@ func RequireAdmin(logger *logrus.Logger) gin.HandlerFunc {
 			return
 		}
 
-		// Check if user is admin
-		if !userInfo.IsAdmin {
+		// Check if user is a global admin
+		if userInfo.Role != auth.UserRoleGlobalAdmin {
 			logger.WithFields(logrus.Fields{
 				"path":    c.Request.URL.Path,
 				"email":   userInfo.Email,
 				"subject": userInfo.Subject,
-			}).Warn("Non-admin user attempted to access admin endpoint")
-			c.JSON(http.StatusForbidden, gin.H{"error": "Admin access required"})
+				"role":    userInfo.Role,
+			}).Warn("Non-global-admin user attempted to access global admin endpoint")
+			c.JSON(http.StatusForbidden, gin.H{"error": "Global admin access required"})
 			c.Abort()
 			return
 		}
@@ -84,10 +85,118 @@ func RequireAdmin(logger *logrus.Logger) gin.HandlerFunc {
 	}
 }
 
+// RequireTenantAdmin creates a middleware that requires the user to be a tenant admin for the specific tenant
+func RequireTenantAdmin(tenantAdmins map[string][]string, logger *logrus.Logger) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Get user info from context (set by OIDCAuth middleware)
+		userInfoValue, exists := c.Get("userInfo")
+		if !exists {
+			logger.WithField("path", c.Request.URL.Path).Warn("User info not found in context")
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "User info not found"})
+			c.Abort()
+			return
+		}
+
+		userInfo, ok := userInfoValue.(*auth.UserInfo)
+		if !ok {
+			logger.WithField("path", c.Request.URL.Path).Error("Invalid user info type in context")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid user info"})
+			c.Abort()
+			return
+		}
+
+		// Global admins have access to all tenant admin operations
+		if userInfo.Role == auth.UserRoleGlobalAdmin {
+			logger.WithFields(logrus.Fields{
+				"path":  c.Request.URL.Path,
+				"email": userInfo.Email,
+			}).Debug("Global admin accessing tenant admin endpoint")
+			c.Next()
+			return
+		}
+
+		// Get tenant from context (set by TenantAuth middleware)
+		tenantValue, exists := c.Get(TenantContextKey)
+		if !exists {
+			logger.WithField("path", c.Request.URL.Path).Warn("Tenant not found in context")
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant context missing"})
+			c.Abort()
+			return
+		}
+
+		tenant, ok := tenantValue.(string)
+		if !ok {
+			logger.WithField("path", c.Request.URL.Path).Error("Invalid tenant type in context")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Invalid tenant context"})
+			c.Abort()
+			return
+		}
+
+		// Check if user is a tenant admin for this specific tenant
+		admins, exists := tenantAdmins[tenant]
+		if !exists {
+			logger.WithFields(logrus.Fields{
+				"path":   c.Request.URL.Path,
+				"tenant": tenant,
+			}).Warn("No tenant admins configured for tenant")
+			c.JSON(http.StatusForbidden, gin.H{"error": "Tenant admin access required"})
+			c.Abort()
+			return
+		}
+
+		isTenantAdmin := false
+		for _, admin := range admins {
+			if admin == userInfo.Email {
+				isTenantAdmin = true
+				break
+			}
+		}
+
+		if !isTenantAdmin {
+			logger.WithFields(logrus.Fields{
+				"path":   c.Request.URL.Path,
+				"email":  userInfo.Email,
+				"tenant": tenant,
+			}).Warn("Non-tenant-admin user attempted to access tenant admin endpoint")
+			c.JSON(http.StatusForbidden, gin.H{"error": "Tenant admin access required"})
+			c.Abort()
+			return
+		}
+
+		logger.WithFields(logrus.Fields{
+			"path":   c.Request.URL.Path,
+			"email":  userInfo.Email,
+			"tenant": tenant,
+		}).Debug("Tenant admin authenticated")
+
+		c.Next()
+	}
+}
+
 // S3Auth creates authentication middleware that supports both OIDC and AWS access key authentication
 // This allows AWS CLI users to authenticate using access keys while web UI users use OIDC
-func S3Auth(authenticator *auth.Authenticator, credStore *store.CredentialStore, groupStore *store.GroupStore, logger *logrus.Logger) gin.HandlerFunc {
+func S3Auth(authenticator *auth.Authenticator, credStores map[string]*store.CredentialStore, logger *logrus.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// Get tenant from context (set by TenantAuth middleware)
+		tenantName := c.GetString(TenantContextKey)
+		if tenantName == "" {
+			logger.WithField("path", c.Request.URL.Path).Warn("No tenant in context")
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Tenant context missing"})
+			c.Abort()
+			return
+		}
+
+		credStore, credExists := credStores[tenantName]
+		if !credExists {
+			logger.WithFields(logrus.Fields{
+				"path":   c.Request.URL.Path,
+				"tenant": tenantName,
+			}).Warn("Credential store not found for tenant")
+			c.JSON(http.StatusNotFound, gin.H{"error": "Tenant not configured"})
+			c.Abort()
+			return
+		}
+
 		authHeader := c.GetHeader("Authorization")
 		credHeader := c.GetHeader("X-S3-Credential-AccessKey")
 
@@ -116,6 +225,7 @@ func S3Auth(authenticator *auth.Authenticator, credStore *store.CredentialStore,
 
 			logger.WithFields(logrus.Fields{
 				"path":       c.Request.URL.Path,
+				"tenant":     tenantName,
 				"access_key": accessKeyID,
 			}).Debug("Authenticating request with AWS SigV4 access key")
 

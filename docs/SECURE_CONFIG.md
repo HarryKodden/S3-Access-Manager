@@ -78,9 +78,11 @@ grep ".env" .gitignore
 | `OIDC_ISSUER` | OIDC provider URL | Yes |
 | `OIDC_CLIENT_ID` | OAuth client ID | Yes |
 | `OIDC_CLIENT_SECRET` | OAuth client secret | Yes |
-| `OIDC_ROLES_CLAIM` | JWT claim for roles | No (default: "Roles") |
+| `OIDC_SCOPES` | OIDC scopes to request | No (default: "openid profile email eduPersonEntitlement") |
+| `OIDC_ROLES_CLAIM` | JWT claim for roles | No (default: "groups") |
 | `OIDC_USER_CLAIM` | JWT claim for user ID | No (default: "sub") |
 | `OIDC_EMAIL_CLAIM` | JWT claim for email | No (default: "email") |
+| `OIDC_SESSION_CACHE_TTL` | Session cache TTL | No (default: "15m") |
 
 ### S3 Backend
 
@@ -88,12 +90,27 @@ grep ".env" .gitignore
 |----------|-------------|----------|-------------|
 | `S3_ENDPOINT` | S3 API endpoint | No | - |
 | `S3_REGION` | AWS region | Yes | `AWS_REGION` |
-| `S3_ACCESS_KEY` | AWS access key | Yes* | `AWS_ACCESS_KEY_ID` |
-| `S3_SECRET_KEY` | AWS secret key | Yes* | `AWS_SECRET_ACCESS_KEY` |
-| `S3_USE_IAM_ROLE` | Use IAM role (true/false) | No | - |
 | `S3_FORCE_PATH_STYLE` | Force path-style URLs | No | - |
 
-\* Not required if using IAM roles (`S3_USE_IAM_ROLE=true`)
+### SCIM Integration
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `SCIM_API_KEY` | API key for SCIM server authentication | No |
+
+### SRAM Integration
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `SRAM_API_URL` | SRAM API base URL | No |
+| `SRAM_API_KEY` | SRAM API key for authentication | No |
+| `SRAM_ENABLED` | Enable/disable SRAM integration | No (default: false) |
+
+### Global Configuration
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `GLOBAL_ADMINS` | Comma-separated list of global admin email addresses | No |
 
 ## Deployment Scenarios
 

@@ -4,7 +4,8 @@ const CONFIG = {
     gatewayUrl: '',  // Empty string since frontend and API are on same origin
     oidcStorage: 'oidc_config',
     tokenStorage: 'auth_token',
-    userStorage: 'user_info'
+    userStorage: 'user_info',
+    tenant: null     // Will be set from URL path
 };
 
 // State Management
@@ -14,6 +15,7 @@ const state = {
     credentials: [],
     selectedCredential: null,  // Selected credential for S3 operations
     actualIsAdmin: false,      // Admin status from backend
+    isGlobalAdmin: false,      // Global admin status from backend
     loadingCount: 0            // Counter for concurrent API calls
 };
 
@@ -37,12 +39,52 @@ function hideLoadingSpinner() {
     }
 }
 
+// Extract tenant from URL path
+function getTenantFromPath() {
+    const path = window.location.pathname;
+    const match = path.match(/^\/tenant\/([^\/]+)/);
+    return match ? match[1] : null;
+}
+
+// Load OIDC configuration from backend
+async function loadOIDCConfig() {
+    try {
+        let endpoint = '/oidc-config';
+        if (CONFIG.tenant) {
+            endpoint = `/tenant/${CONFIG.tenant}/oidc-config`;
+        }
+        
+        const response = await fetch(`${CONFIG.gatewayUrl}${endpoint}`);
+        if (!response.ok) {
+            throw new Error('Failed to load OIDC configuration');
+        }
+        const config = await response.json();
+        
+        // Set the form values
+        document.getElementById('oidc-issuer').value = config.issuer || '';
+        document.getElementById('client-id').value = config.client_id || '';
+        
+        console.log('OIDC config loaded:', config);
+    } catch (error) {
+        console.error('Failed to load OIDC config:', error);
+        showToast('Failed to load OIDC configuration', 'error');
+    }
+}
+
 // Initialize App
 document.addEventListener('DOMContentLoaded', () => {
     initializeApp();
 });
 
 function initializeApp() {
+    // Extract tenant from URL
+    CONFIG.tenant = getTenantFromPath();
+    
+    // Load OIDC configuration if on login screen
+    if (document.getElementById('login-screen').classList.contains('active')) {
+        loadOIDCConfig();
+    }
+    
     // Check if this is an OIDC callback
     const urlParams = new URLSearchParams(window.location.search);
     const code = urlParams.get('code');
@@ -70,6 +112,8 @@ function initializeApp() {
     if (storedToken && storedUser) {
         state.token = storedToken; // This is the access token
         state.userInfo = JSON.parse(storedUser);
+        state.actualIsAdmin = localStorage.getItem('is_admin') === 'true';
+        state.isGlobalAdmin = localStorage.getItem('is_global_admin') === 'true';
         
         // Validate token by checking gateway health with auth
         validateTokenAndShowDashboard();
@@ -84,6 +128,36 @@ function initializeApp() {
 }
 
 async function validateTokenAndShowDashboard() {
+    console.log('validateTokenAndShowDashboard called, tenant:', CONFIG.tenant);
+    
+    // If no tenant context, we can't validate via credentials endpoint
+    // For non-global admins, show tenant selection directly
+    if (!CONFIG.tenant) {
+        console.log('No tenant context, checking if global admin...');
+        // Try to determine if user is global admin by checking a root-level endpoint
+        try {
+            // Use apiCall which adds auth headers
+            const data = await apiCall('/tenants', { method: 'GET' });
+            console.log('Tenants response:', data);
+            
+            // Check if user is a global admin from the response
+            state.isGlobalAdmin = data.is_global_admin || false;
+            state.actualIsAdmin = state.isGlobalAdmin;
+            localStorage.setItem('is_global_admin', state.isGlobalAdmin ? 'true' : 'false');
+            console.log('Set isGlobalAdmin to', state.isGlobalAdmin, ', calling showDashboard');
+            showDashboard(); // This will show tenant selection for non-global admins, or dashboard for global admins
+            return;
+        } catch (error) {
+            console.error('Failed to check tenant access:', error);
+        }
+        
+        // If tenant access check fails, show tenant selection anyway
+        console.log('Tenant access check failed, showing tenant selection screen');
+        showTenantSelectionScreen();
+        return;
+    }
+    
+    // We're in a tenant context, validate via credentials endpoint
     try {
         // Try to access credentials endpoint to validate token and get user info
         const response = await apiCall('/settings/credentials');
@@ -103,10 +177,12 @@ async function validateTokenAndShowDashboard() {
         const userRoles = response.user_roles || [];
         state.userRoles = userRoles;
         state.actualIsAdmin = response.is_admin || false;
+        state.isGlobalAdmin = response.is_global_admin || false;
         state.userGroups = response.user_groups || [];
         
         // Store admin status
         localStorage.setItem('is_admin', state.actualIsAdmin.toString());
+        localStorage.setItem('is_global_admin', state.isGlobalAdmin.toString());
         
         showDashboard();
         const username = state.userInfo.name || state.userInfo.email || state.userInfo.sub || 'User';
@@ -154,7 +230,7 @@ async function handleOIDCCallback(code, receivedState) {
         const discovery = await discoverOIDCEndpoints(oidcConfig.issuer);
         
         // Exchange authorization code for tokens
-        const redirectUri = window.location.origin + '/callback';
+        const redirectUri = window.location.origin + (CONFIG.tenant ? `/tenant/${CONFIG.tenant}` : '') + '/callback';
         const tokenParams = new URLSearchParams({
             grant_type: 'authorization_code',
             code: code,
@@ -209,24 +285,29 @@ async function handleOIDCCallback(code, receivedState) {
             localStorage.setItem('id_token', tokens.id_token);
         }
         
-        console.log('Tokens stored, fetching user info from backend...');
+        console.log('Tokens stored, checking tenant context...');
         
-        // Get authoritative user info from backend (respects OIDC_USER_CLAIM)
-        try {
-            const response = await apiCall('/settings/credentials');
-            if (response.user_info) {
-                const backendUserInfo = {
-                    subject: response.user_info.subject,
-                    email: response.user_info.email,
-                    name: response.user_info.email, // Use email as display name
-                    sub: response.user_info.subject
-                };
-                state.userInfo = backendUserInfo;
-                localStorage.setItem(CONFIG.userStorage, JSON.stringify(backendUserInfo));
-                console.log('User info updated from backend:', backendUserInfo.email);
+        // Get authoritative user info from backend only if we're in a tenant context
+        // Without tenant context, /settings/credentials will fail for non-global admins
+        if (CONFIG.tenant) {
+            try {
+                const response = await apiCall('/settings/credentials');
+                if (response.user_info) {
+                    const backendUserInfo = {
+                        subject: response.user_info.subject,
+                        email: response.user_info.email,
+                        name: response.user_info.email, // Use email as display name
+                        sub: response.user_info.subject
+                    };
+                    state.userInfo = backendUserInfo;
+                    localStorage.setItem(CONFIG.userStorage, JSON.stringify(backendUserInfo));
+                    console.log('User info updated from backend:', backendUserInfo.email);
+                }
+            } catch (error) {
+                console.error('Failed to get user info from backend, using JWT data:', error);
             }
-        } catch (error) {
-            console.error('Failed to get user info from backend, using JWT data:', error);
+        } else {
+            console.log('No tenant context, skipping credentials endpoint call');
         }
         
         // Clean up
@@ -237,22 +318,8 @@ async function handleOIDCCallback(code, receivedState) {
         // Setup event listeners
         setupEventListeners();
         
-        // Show dashboard without triggering data loads yet
-        document.getElementById('login-screen').classList.remove('active');
-        document.getElementById('dashboard-screen').classList.add('active');
-        
-        // Update user info display
-        if (state.userInfo) {
-            document.getElementById('user-info').textContent = 
-                state.userInfo.name || state.userInfo.email || state.userInfo.sub || 'User';
-        }
-        
-        // Check admin status - will be set by credentials call
-        state.actualIsAdmin = false;
-        
-        // Load initial dashboard data
-        checkGatewayHealth();
-        loadCredentials();
+        // Validate token and show appropriate screen (tenant selection or dashboard)
+        validateTokenAndShowDashboard();
         
         // Show welcome message with username
         const username = state.userInfo.name || state.userInfo.email || state.userInfo.sub || 'User';
@@ -293,6 +360,12 @@ function setupEventListeners() {
     // Logout
     document.getElementById('logout-btn').addEventListener('click', handleLogout);
     
+    // Tenant name badge - click to switch tenant
+    const tenantNameBadge = document.getElementById('tenant-name');
+    if (tenantNameBadge) {
+        tenantNameBadge.addEventListener('click', handleSwitchTenant);
+    }
+    
     // Admin mode toggle
     const adminToggle = document.getElementById('admin-mode-toggle');
     // Admin toggle removed - admin status is now determined by backend
@@ -308,15 +381,34 @@ function setupEventListeners() {
         tab.addEventListener('click', () => switchTab(tab.dataset.tab));
     });
     
-    // Credentials
-    document.getElementById('create-credential-btn').addEventListener('click', async () => {
-        showModal('create-credential-modal');
-        await loadAvailableRolesForCredential();
-    });
-    document.getElementById('update-credentials-btn').addEventListener('click', updateAllCredentials);
-    document.getElementById('confirm-create-credential').addEventListener('click', handleCreateCredential);
-    document.getElementById('confirm-save-policy').addEventListener('click', savePolicy);
-    document.getElementById('confirm-save-group').addEventListener('click', saveRole);
+    // Credentials - only set up if elements exist (dashboard screen)
+    const createCredentialBtn = document.getElementById('create-credential-btn');
+    if (createCredentialBtn) {
+        createCredentialBtn.addEventListener('click', async () => {
+            showModal('create-credential-modal');
+            await loadAvailableRolesForCredential();
+        });
+    }
+    
+    const updateCredentialsBtn = document.getElementById('update-credentials-btn');
+    if (updateCredentialsBtn) {
+        updateCredentialsBtn.addEventListener('click', updateAllCredentials);
+    }
+    
+    const confirmCreateCredentialBtn = document.getElementById('confirm-create-credential');
+    if (confirmCreateCredentialBtn) {
+        confirmCreateCredentialBtn.addEventListener('click', handleCreateCredential);
+    }
+    
+    const confirmSavePolicyBtn = document.getElementById('confirm-save-policy');
+    if (confirmSavePolicyBtn) {
+        confirmSavePolicyBtn.addEventListener('click', savePolicy);
+    }
+    
+    const confirmSaveGroupBtn = document.getElementById('confirm-save-group');
+    if (confirmSaveGroupBtn) {
+        confirmSaveGroupBtn.addEventListener('click', saveRole);
+    }
     
     // Modal close buttons
     document.querySelectorAll('.modal-close, .modal-cancel').forEach(btn => {
@@ -324,22 +416,338 @@ function setupEventListeners() {
     });
     
     // Policy JSON change listener - invalidate validation when content changes
-    document.getElementById('policy-json').addEventListener('input', () => {
-        if (state.policyValidated) {
-            document.getElementById('confirm-save-policy').disabled = true;
-            document.getElementById('policy-validation').innerHTML = '<span style="color: #f59e0b;">⚠ Content changed - please validate again</span>';
-            state.policyValidated = false;
-        }
-    });
+    const policyJsonEl = document.getElementById('policy-json');
+    if (policyJsonEl) {
+        policyJsonEl.addEventListener('input', () => {
+            if (state.policyValidated) {
+                const confirmBtn = document.getElementById('confirm-save-policy');
+                const validationEl = document.getElementById('policy-validation');
+                if (confirmBtn) confirmBtn.disabled = true;
+                if (validationEl) {
+                    validationEl.innerHTML = '<span style="color: #f59e0b;">⚠ Content changed - please validate again</span>';
+                }
+                state.policyValidated = false;
+            }
+        });
+    }
 }
 
 // Screen Management
 function showLoginScreen() {
     document.getElementById('login-screen').classList.add('active');
     document.getElementById('dashboard-screen').classList.remove('active');
+    document.getElementById('tenant-selection-screen').classList.remove('active');
     
     // Fetch OIDC configuration from backend
     fetchOIDCConfiguration();
+}
+
+function showTenantSelectionScreen() {
+    console.log('showTenantSelectionScreen called, isGlobalAdmin:', state.isGlobalAdmin);
+    document.getElementById('login-screen').classList.remove('active');
+    document.getElementById('dashboard-screen').classList.remove('active');
+    document.getElementById('tenant-selection-screen').classList.add('active');
+    
+    // Show create tenant button only for global admins
+    const createTenantBtn = document.getElementById('create-tenant-btn');
+    if (createTenantBtn) {
+        createTenantBtn.style.display = state.isGlobalAdmin ? 'inline-block' : 'none';
+    }
+    
+    // Update title based on user type
+    const titleEl = document.querySelector('#tenant-selection-screen h1');
+    if (titleEl) {
+        if (state.isGlobalAdmin) {
+            titleEl.textContent = 'Manage Tenants';
+        } else {
+            titleEl.textContent = 'Select Tenant';
+        }
+    }
+    
+    // Load available tenants
+    console.log('About to call loadTenantsForSelection()');
+    loadTenantsForSelection();
+}
+
+async function loadTenantsForSelection() {
+    console.log('loadTenantsForSelection called');
+    try {
+        console.log('Fetching tenants from /tenants endpoint...');
+        const data = await apiCall('/tenants', {
+            method: 'GET'
+        });
+        console.log('Tenants data received:', data);
+        
+        const tenantList = document.getElementById('tenant-list');
+        tenantList.innerHTML = '';
+        
+        data.tenants.forEach(tenant => {
+            const tenantCard = document.createElement('div');
+            tenantCard.className = 'tenant-card';
+            
+            // For global admins on tenant selection screen, add management buttons
+            if (state.isGlobalAdmin && !CONFIG.tenant) {
+                tenantCard.innerHTML = `
+                    <div class="tenant-info">
+                        <h3>${tenant.name}</h3>
+                        <p>${tenant.description || 'Manage S3 access for this tenant'}</p>
+                    </div>
+                    <div class="tenant-actions" style="display: flex; gap: 0.5rem;">
+                        <button class="btn-icon" onclick="selectTenant('${tenant.name}'); event.stopPropagation();" title="Manage Tenant">
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                <path d="M9 18l6-6-6-6"/>
+                            </svg>
+                        </button>
+                        <button class="btn-icon" onclick="inspectTenant('${tenant.name}'); event.stopPropagation();" title="View Details">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                                <circle cx="12" cy="12" r="3"></circle>
+                            </svg>
+                        </button>
+                        <button class="btn-icon" onclick="editTenant('${tenant.name}'); event.stopPropagation();" title="Edit">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+                                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+                            </svg>
+                        </button>
+                        <button class="btn-icon" onclick="refreshTenantSRAM('${tenant.name}'); event.stopPropagation();" title="Refresh SRAM Status">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                <polyline points="23 4 23 10 17 10"></polyline>
+                                <polyline points="1 20 1 14 7 14"></polyline>
+                                <path d="M20.49 9A9 9 0 0 0 5.64 5.64L1 10m22 4l-4.64 4.36A9 9 0 0 1 3.51 15"></path>
+                            </svg>
+                        </button>
+                        <button class="btn-icon btn-danger" onclick="deleteTenant('${tenant.name}'); event.stopPropagation();" title="Delete">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                <polyline points="3 6 5 6 21 6"></polyline>
+                                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                            </svg>
+                        </button>
+                    </div>
+                `;
+            } else {
+                // For regular users, simple click-to-select
+                tenantCard.onclick = () => selectTenant(tenant.name);
+                tenantCard.innerHTML = `
+                    <div class="tenant-info">
+                        <h3>${tenant.name}</h3>
+                        <p>${tenant.description || 'Manage S3 access for this tenant'}</p>
+                    </div>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                        <path d="M9 18l6-6-6-6"/>
+                    </svg>
+                `;
+            }
+            
+            tenantList.appendChild(tenantCard);
+        });
+    } catch (error) {
+        console.error('Failed to load tenants:', error);
+        showToast('Failed to load tenants', 'error');
+    }
+}
+
+function selectTenant(tenantName) {
+    // Redirect to the selected tenant
+    window.location.href = `/tenant/${tenantName}/`;
+}
+
+async function refreshTenantSRAM(tenantName) {
+    try {
+        showToast('Refreshing SRAM status...', 'info');
+        
+        const response = await fetch(`${CONFIG.gatewayUrl}/tenants/${tenantName}/sram-refresh`, {
+            method: 'POST',
+            headers: getAuthHeaders()
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to refresh SRAM status');
+        }
+
+        const data = await response.json();
+        
+        if (data.admin_accepted) {
+            showToast(`✅ SRAM status refreshed: Admin invitation accepted`, 'success');
+        } else {
+            showToast(`🔄 SRAM status refreshed: No admin accepted yet`, 'info');
+        }
+        
+        // Optionally refresh the tenant list to update any visual indicators
+        await loadTenants();
+        
+    } catch (error) {
+        console.error('Failed to refresh tenant SRAM status:', error);
+        showToast('Failed to refresh SRAM status: ' + error.message, 'error');
+    }
+}
+
+// Tenant switcher functions
+let availableTenants = [];
+
+async function loadAvailableTenants() {
+    try {
+        const data = await apiCall('/tenants', { method: 'GET', skipTenantPrefix: true });
+        availableTenants = data.tenants || [];
+        
+        // Update tenant switcher visibility
+        const switcher = document.getElementById('tenant-switcher');
+        if (CONFIG.tenant && availableTenants.length > 1 && !state.isGlobalAdmin) {
+            // Show switcher only for non-global admins with multiple tenants
+            switcher.style.display = 'block';
+        } else if (CONFIG.tenant) {
+            // Just show tenant name without dropdown for single tenant or global admins
+            switcher.style.display = 'block';
+            const badge = document.getElementById('tenant-name');
+            badge.onclick = null;
+            badge.style.cursor = availableTenants.length > 1 ? 'pointer' : 'default';
+        }
+        
+        return availableTenants;
+    } catch (error) {
+        console.error('Failed to load available tenants:', error);
+        return [];
+    }
+}
+
+function toggleTenantDropdown() {
+    if (availableTenants.length <= 1) return; // Don't show dropdown for single tenant
+    
+    const dropdown = document.getElementById('tenant-dropdown');
+    const isVisible = dropdown.style.display === 'block';
+    
+    if (isVisible) {
+        dropdown.style.display = 'none';
+    } else {
+        // Populate dropdown with available tenants
+        dropdown.innerHTML = availableTenants.map(tenant => {
+            const isActive = tenant.name === CONFIG.tenant;
+            return `
+                <div class="tenant-dropdown-item ${isActive ? 'active' : ''}" onclick="switchToTenant('${tenant.name}')">
+                    <span>${tenant.name}</span>
+                    ${isActive ? '<span>✓</span>' : ''}
+                </div>
+            `;
+        }).join('');
+        
+        dropdown.style.display = 'block';
+    }
+}
+
+function switchToTenant(tenantName) {
+    if (tenantName === CONFIG.tenant) {
+        // Already on this tenant, just close dropdown
+        document.getElementById('tenant-dropdown').style.display = 'none';
+        return;
+    }
+    
+    // Redirect to the selected tenant
+    window.location.href = `/tenant/${tenantName}/`;
+}
+
+// Close dropdown when clicking outside
+document.addEventListener('click', (event) => {
+    const switcher = document.getElementById('tenant-switcher');
+    const dropdown = document.getElementById('tenant-dropdown');
+    
+    if (switcher && dropdown && !switcher.contains(event.target)) {
+        dropdown.style.display = 'none';
+    }
+});
+
+function showCreateTenantForm() {
+    document.getElementById('create-tenant-form').style.display = 'block';
+    document.getElementById('create-tenant-btn').style.display = 'none';
+    document.getElementById('new-tenant-name').focus();
+}
+
+function hideCreateTenantForm() {
+    document.getElementById('create-tenant-form').style.display = 'none';
+    document.getElementById('create-tenant-btn').style.display = 'inline-block';
+    document.getElementById('new-tenant-name').value = '';
+    document.getElementById('new-tenant-description').value = '';
+    document.getElementById('new-tenant-admin-emails').value = '';
+    document.getElementById('new-tenant-iam-access-key').value = '';
+    document.getElementById('new-tenant-iam-secret-key').value = '';
+}
+
+async function createTenant() {
+    const nameEl = document.getElementById('new-tenant-name');
+    const name = nameEl ? nameEl.value.trim() : '';
+    const description = document.getElementById('new-tenant-description').value.trim();
+    const adminEmailsText = document.getElementById('new-tenant-admin-emails').value.trim();
+    const iamAccessKey = document.getElementById('new-tenant-iam-access-key').value.trim();
+    const iamSecretKey = document.getElementById('new-tenant-iam-secret-key').value.trim();
+
+    if (!name) {
+        showToast('Tenant name is required', 'error');
+        return;
+    }
+
+    if (name.length > 50) {
+        showToast('Tenant name must be 50 characters or less', 'error');
+        return;
+    }
+
+    // Parse admin emails - split by newlines and filter empty lines
+    const adminEmails = adminEmailsText
+        .split('\n')
+        .map(email => email.trim())
+        .filter(email => email.length > 0);
+
+    if (adminEmails.length === 0) {
+        showToast('At least one admin email is required', 'error');
+        return;
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    for (const email of adminEmails) {
+        if (!emailRegex.test(email)) {
+            showToast(`Invalid email format: ${email}`, 'error');
+            return;
+        }
+    }
+
+    try {
+        const payload = {
+            name: name,
+            description: description || undefined,
+            admin_emails: adminEmails,
+            iam_access_key: iamAccessKey,
+            iam_secret_key: iamSecretKey
+        };
+
+        const response = await fetch(`${CONFIG.gatewayUrl}/tenants`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${state.token}`
+            },
+            body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to create tenant');
+        }
+
+        const result = await response.json();
+        let message = `Tenant "${result.name}" created successfully!`;
+        if (!iamAccessKey) {
+            message += ' (IAM credentials can be added later)';
+        }
+        showToast(message, 'success');
+        
+        // Hide the form and reload tenants
+        hideCreateTenantForm();
+        loadTenants();
+        
+    } catch (error) {
+        console.error('Failed to create tenant:', error);
+        showToast(error.message || 'Failed to create tenant', 'error');
+    }
 }
 
 async function fetchOIDCConfiguration() {
@@ -375,39 +783,122 @@ async function fetchOIDCConfiguration() {
 }
 
 function showDashboard() {
+    // If no tenant is selected and user is authenticated
+    if (!CONFIG.tenant && state.token) {
+        // If user is a global admin, show dashboard with tenant management tab
+        if (state.isGlobalAdmin) {
+            // Continue to show dashboard - they can manage tenants from the tab
+        } else {
+            // Regular user or tenant admin - must select a tenant first
+            showTenantSelectionScreen();
+            return;
+        }
+    }
+    
     document.getElementById('login-screen').classList.remove('active');
     document.getElementById('dashboard-screen').classList.add('active');
+    document.getElementById('tenant-selection-screen').classList.remove('active');
+    
+    // Update tenant name in header
+    updateTenantNameDisplay();
+    
+    // Load available tenants for switcher (for non-global admins with multiple tenants)
+    if (CONFIG.tenant && !state.isGlobalAdmin) {
+        loadAvailableTenants();
+    }
     
     // Update user info display
     if (state.userInfo) {
         const userEmail = state.userInfo.email || state.userInfo.sub || 'User';
-        const isAdmin = state.actualIsAdmin ? ' (Admin)' : '';
-        document.getElementById('user-info').textContent = userEmail + isAdmin;
+        let roleLabel = '';
+        if (state.isGlobalAdmin) {
+            roleLabel = ' (Global Admin)';
+        } else if (state.actualIsAdmin) {
+            roleLabel = ' (Tenant Admin)';
+        }
+        document.getElementById('user-info').textContent = userEmail + roleLabel;
     }
     
     // Update admin UI elements
     updateAdminUI();
     
-    // Load initial data
-    checkGatewayHealth();
-    loadCredentials();
+    // Load initial data and start health monitoring
+    startHealthCheckPolling();
+    
+    // For global admins without a tenant, show tenants tab by default
+    if (state.isGlobalAdmin && !CONFIG.tenant) {
+        switchTab('tenants');
+    } else {
+        loadCredentials();
+    }
 }
 
 // Update UI based on admin status
 function updateAdminUI() {
-    const isAdmin = state.actualIsAdmin;
+    const isTenantAdmin = state.actualIsAdmin && !state.isGlobalAdmin;
+    const isGlobalAdmin = state.isGlobalAdmin;
+    const inTenantContext = !!CONFIG.tenant;
     
-    // Show/hide admin-only elements
-    document.querySelectorAll('.admin-only').forEach(el => {
-        el.style.display = isAdmin ? '' : 'none';
+    console.log('Updating UI with roles:', {
+        isTenantAdmin,
+        isGlobalAdmin,
+        actualIsAdmin: state.actualIsAdmin,
+        inTenantContext
     });
     
-    // If not admin and on an admin-only tab, switch to credentials tab
-    if (!isAdmin) {
-        const activeTab = document.querySelector('.tab.active');
-        if (activeTab && activeTab.classList.contains('admin-only')) {
-            showTab('credentials');
+    // Show/hide credentials tab based on whether we're on a tenant page
+    const credentialsTab = document.querySelector('.tab[data-tab="credentials"]');
+    if (credentialsTab) {
+        if (CONFIG.tenant) {
+            credentialsTab.style.display = 'block';
+        } else {
+            credentialsTab.style.display = 'none';
         }
+    }
+    
+    // Show/hide tenant admin elements (policies, roles)
+    document.querySelectorAll('.tenant-admin-only').forEach(el => {
+        el.style.display = isTenantAdmin ? 'block' : 'none';
+    });
+    
+    // Show/hide global admin elements (tenants tab)
+    document.querySelectorAll('.global-admin-only').forEach(el => {
+        el.style.display = isGlobalAdmin ? 'block' : 'none';
+    });
+    
+    // Show/hide global admin elements (tenants)
+    document.querySelectorAll('.global-admin-only').forEach(el => {
+        el.style.display = isGlobalAdmin ? 'block' : 'none';
+    });
+    
+    // Show/hide admin-only elements (both types of admins)
+    document.querySelectorAll('.admin-only').forEach(el => {
+        el.style.display = state.actualIsAdmin ? 'block' : 'none';
+    });
+    
+    // If on an invalid tab for current role, switch to appropriate tab
+    const activeTab = document.querySelector('.tab.active');
+    if (activeTab) {
+        const tabName = activeTab.dataset.tab;
+        if ((tabName === 'policies' || tabName === 'roles') && !isTenantAdmin) {
+            switchTab(CONFIG.tenant ? 'credentials' : 'tenants');
+        } else if (tabName === 'tenants' && !isGlobalAdmin) {
+            switchTab(CONFIG.tenant ? 'credentials' : 'tenants');
+        } else if (tabName === 'credentials' && !CONFIG.tenant) {
+            switchTab('tenants');
+        }
+    }
+}
+
+// Update tenant name display in header
+function updateTenantNameDisplay() {
+    const tenantNameElement = document.getElementById('tenant-name');
+    
+    if (CONFIG.tenant) {
+        tenantNameElement.textContent = CONFIG.tenant;
+        tenantNameElement.style.display = 'inline-block';
+    } else {
+        tenantNameElement.style.display = 'none';
     }
 }
 
@@ -494,7 +985,7 @@ async function handleLogin() {
         sessionStorage.setItem('oauth_state', state);
         
         // Build authorization URL
-        const redirectUri = window.location.origin + '/callback';
+        const redirectUri = window.location.origin + (CONFIG.tenant ? `/tenant/${CONFIG.tenant}` : '') + '/callback';
         const authParams = new URLSearchParams({
             client_id: clientId,
             redirect_uri: redirectUri,
@@ -522,9 +1013,16 @@ function handleLogout() {
     localStorage.removeItem(CONFIG.tokenStorage);
     localStorage.removeItem(CONFIG.userStorage);
     localStorage.removeItem('refresh_token');
+    localStorage.removeItem('is_admin');
+    localStorage.removeItem('is_global_admin');
     
     showLoginScreen();
     showToast('Logged out successfully', 'success');
+}
+
+function handleSwitchTenant() {
+    // Navigate back to root to select a different tenant
+    window.location.href = '/';
 }
 
 // Tab Navigation
@@ -551,6 +1049,9 @@ function switchTab(tabName) {
         case 'roles':
             loadRoles();
             break;
+        case 'tenants':
+            loadTenants();
+            break;
         case 'users':
             loadUsers();
             break;
@@ -565,8 +1066,29 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+// Helper function to get authentication headers
+function getAuthHeaders() {
+    const headers = {
+        'Content-Type': 'application/json'
+    };
+    
+    if (state.token) {
+        headers['Authorization'] = `Bearer ${state.token}`;
+    }
+    
+    return headers;
+}
+
 // API Calls
 async function apiCall(endpoint, options = {}) {
+    // Prepend tenant prefix if tenant is configured and not explicitly skipped
+    let fullEndpoint = endpoint;
+    if (CONFIG.tenant && !options.skipTenantPrefix) {
+        // Remove leading slash from endpoint if present
+        const cleanEndpoint = endpoint.startsWith('/') ? endpoint.substring(1) : endpoint;
+        fullEndpoint = `/tenant/${CONFIG.tenant}/${cleanEndpoint}`;
+    }
+    
     const headers = {
         'Content-Type': 'application/json',
         ...options.headers
@@ -574,9 +1096,9 @@ async function apiCall(endpoint, options = {}) {
     
     if (state.token) {
         headers['Authorization'] = `Bearer ${state.token}`;
-        console.log('API call with auth:', endpoint);
+        console.log('API call with auth:', fullEndpoint);
     } else {
-        console.log('API call without auth:', endpoint);
+        console.log('API call without auth:', fullEndpoint);
     }
     
     // Add credential header for S3 operations
@@ -588,7 +1110,7 @@ async function apiCall(endpoint, options = {}) {
     showLoadingSpinner();
     
     try {
-        const response = await fetch(`${CONFIG.gatewayUrl}${endpoint}`, {
+        const response = await fetch(`${CONFIG.gatewayUrl}${fullEndpoint}`, {
             ...options,
             headers
         });
@@ -667,12 +1189,171 @@ async function checkGatewayHealth() {
         const data = await response.json();
         
         const statusEl = document.getElementById('connection-status');
-        statusEl.classList.add('connected');
-        statusEl.querySelector('span:last-child').textContent = 'Connected';
+        if (statusEl) {
+            statusEl.classList.add('connected');
+            statusEl.querySelector('span:last-child').textContent = 'Connected';
+        }
         
-        document.getElementById('api-version').textContent = data.version || '1.0.0';
+        const versionEl = document.getElementById('api-version');
+        if (versionEl) {
+            versionEl.textContent = data.version || '1.0.0';
+        }
+        
+        // Update health indicator
+        updateHealthIndicator(data);
     } catch {
         showToast('Cannot connect to gateway', 'error');
+        updateHealthIndicator({ healthy: false });
+    }
+}
+
+// Update health indicator in header
+function updateHealthIndicator(healthData) {
+    const indicator = document.getElementById('health-indicator');
+    if (!indicator) return;
+    
+    const isHealthy = healthData.healthy !== false;
+    const healthText = indicator.querySelector('.health-text');
+    
+    // Update indicator class
+    indicator.className = 'health-indicator ' + (isHealthy ? 'healthy' : 'unhealthy');
+    
+    // Update text
+    if (isHealthy) {
+        healthText.textContent = 'Healthy';
+    } else {
+        healthText.textContent = 'Unhealthy';
+    }
+    
+    // Build tooltip with details
+    let tooltip = `System Status: ${isHealthy ? 'Healthy' : 'Unhealthy'}`;
+    
+    if (healthData.sram_connected !== undefined) {
+        tooltip += `\nSRAM: ${healthData.sram_connected ? 'Connected' : 'Disconnected'}`;
+        if (healthData.sram_error) {
+            tooltip += `\n  Error: ${healthData.sram_error}`;
+        }
+    }
+    
+    if (healthData.tenant_health) {
+        const tenantCount = Object.keys(healthData.tenant_health).length;
+        const healthyCount = Object.values(healthData.tenant_health).filter(t => t.healthy).length;
+        tooltip += `\nTenants: ${healthyCount}/${tenantCount} healthy`;
+        
+        // Show details for unhealthy tenants
+        Object.entries(healthData.tenant_health).forEach(([name, health]) => {
+            if (!health.healthy) {
+                tooltip += `\n  ${name}: `;
+                const issues = [];
+                if (!health.admin_accepted) issues.push('No admin accepted');
+                if (!health.iam_working) issues.push('IAM not working');
+                tooltip += issues.join(', ');
+            }
+        });
+    }
+    
+    indicator.title = tooltip;
+    
+    // Add click handler to show detailed health modal
+    indicator.onclick = () => showHealthDetailsModal(healthData);
+}
+
+// Show detailed health information in a modal
+function showHealthDetailsModal(healthData) {
+    const isHealthy = healthData.healthy !== false;
+    
+    let html = `
+        <div class="modal-content">
+            <h2>System Health Status</h2>
+            <div class="health-details">
+                <div class="health-item">
+                    <span class="health-label">Overall Status:</span>
+                    <span class="health-value ${isHealthy ? 'healthy' : 'unhealthy'}">
+                        ${isHealthy ? '✓ Healthy' : '✗ Unhealthy'}
+                    </span>
+                </div>
+    `;
+    
+    if (healthData.sram_connected !== undefined) {
+        html += `
+                <div class="health-item">
+                    <span class="health-label">SRAM Connection:</span>
+                    <span class="health-value ${healthData.sram_connected ? 'healthy' : 'unhealthy'}">
+                        ${healthData.sram_connected ? '✓ Connected' : '✗ Disconnected'}
+                    </span>
+                </div>
+        `;
+        if (healthData.sram_error) {
+            html += `
+                <div class="health-item error">
+                    <span class="health-label">SRAM Error:</span>
+                    <span class="health-value">${healthData.sram_error}</span>
+                </div>
+            `;
+        }
+    }
+    
+    if (healthData.tenant_health) {
+        html += `
+                <div class="health-item">
+                    <h3 style="margin-top: 1rem; margin-bottom: 0.5rem;">Tenant Health</h3>
+                </div>
+        `;
+        
+        Object.entries(healthData.tenant_health).forEach(([name, health]) => {
+            html += `
+                <div class="health-item tenant-health">
+                    <span class="health-label">${name}:</span>
+                    <span class="health-value ${health.healthy ? 'healthy' : 'unhealthy'}">
+                        ${health.healthy ? '✓ Healthy' : '✗ Unhealthy'}
+                    </span>
+                    <div class="tenant-health-details">
+                        <span>Admin Accepted: ${health.admin_accepted ? '✓' : '✗'}</span>
+                        <span>IAM Working: ${health.iam_working ? '✓' : '✗'}</span>
+                    </div>
+                </div>
+            `;
+        });
+    }
+    
+    if (healthData.last_checked) {
+        const lastChecked = new Date(healthData.last_checked).toLocaleString();
+        html += `
+                <div class="health-item" style="margin-top: 1rem; font-size: 0.875rem; color: var(--text-secondary);">
+                    Last checked: ${lastChecked}
+                </div>
+        `;
+    }
+    
+    html += `
+            </div>
+            <button class="btn btn-primary" onclick="closeModal()">Close</button>
+        </div>
+    `;
+    
+    showModal(html);
+}
+
+// Start health check polling (every 30 seconds)
+let healthCheckInterval = null;
+function startHealthCheckPolling() {
+    if (healthCheckInterval) {
+        clearInterval(healthCheckInterval);
+    }
+    
+    // Initial check
+    checkGatewayHealth();
+    
+    // Poll every 30 seconds
+    healthCheckInterval = setInterval(() => {
+        checkGatewayHealth();
+    }, 30000);
+}
+
+function stopHealthCheckPolling() {
+    if (healthCheckInterval) {
+        clearInterval(healthCheckInterval);
+        healthCheckInterval = null;
     }
 }
 
@@ -804,6 +1485,23 @@ async function loadAvailableRolesForCredential() {
         console.log('Roles API response:', response);
         let roles = response.groups || [];  // Backend returns 'groups' not 'roles'
         
+        // Fetch SCIM groups to get displayName and id
+        let scimGroupsMap = {};
+        try {
+            const scimResponse = await apiCall('/settings/sram-groups');
+            const scimGroups = scimResponse.Resources || [];
+            scimGroupsMap = scimGroups.reduce((map, group) => {
+                map[group.id] = {
+                    id: group.id,
+                    displayName: group.displayName || group.name,
+                    shortName: group.shortName
+                };
+                return map;
+            }, {});
+        } catch (error) {
+            console.error('Failed to load SCIM groups for role display:', error);
+        }
+        
         // Check if user is admin
         const isAdmin = state.actualIsAdmin;
         
@@ -814,7 +1512,7 @@ async function loadAvailableRolesForCredential() {
             
             console.log('Filtered roles for non-admin user:', {
                 userGroups: state.userGroups,
-                availableRoles: roles.map(r => r.name)
+                availableRoles: roles.map(r => r.scim_id)
             });
         }
         
@@ -822,6 +1520,8 @@ async function loadAvailableRolesForCredential() {
         
         if (roles.length > 0) {
             roles.forEach(role => {
+                const scimInfo = role.scim_id ? scimGroupsMap[role.scim_id] : null;
+                const displayName = scimInfo?.displayName || role.name || role.scim_id || 'Unknown Role';
                 const label = document.createElement('label');
                 label.style.display = 'flex';
                 label.style.alignItems = 'center';
@@ -845,7 +1545,7 @@ async function loadAvailableRolesForCredential() {
                 
                 const span = document.createElement('span');
                 span.style.fontWeight = 'bold';
-                span.textContent = role.name.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+                span.textContent = displayName.replace(/-/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
                 
                 textDiv.appendChild(span);
                 
@@ -1218,13 +1918,13 @@ async function loadPolicies() {
                                 <circle cx="12" cy="12" r="3"></circle>
                             </svg>
                         </button>
-                        <button class="btn-icon admin-only" onclick="editPolicy('${policy.name}')" title="Edit" style="display: ${isAdmin ? '' : 'none'};">
+                        <button class="btn-icon admin-only" onclick="editPolicy('${policy.name}')" title="Edit">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
                                 <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
                                 <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
                             </svg>
                         </button>
-                        <button class="btn-icon btn-danger admin-only" onclick="deletePolicy('${policy.name}')" title="Delete" style="display: ${isAdmin ? '' : 'none'};">
+                        <button class="btn-icon btn-danger admin-only" onclick="deletePolicy('${policy.name}')" title="Delete">
                             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
                                 <polyline points="3 6 5 6 21 6"></polyline>
                                 <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
@@ -1234,6 +1934,9 @@ async function loadPolicies() {
                 </div>
             `).join('');
         }
+        
+        // Update admin UI for newly created elements
+        updateAdminUI();
     } catch (error) {
         listEl.innerHTML = `<div class="empty-state">Failed to load policies: ${error.message}</div>`;
     }
@@ -1413,26 +2116,28 @@ async function validatePolicyJSON() {
 
 async function loadRoles() {
     try {
-        const response = await apiCall('/settings/roles');
-        const roles = response.groups || [];  // Backend returns "groups" key for backward compatibility
+        // Fetch roles
+        const rolesResponse = await apiCall('/settings/roles');
+        const roles = rolesResponse.groups || [];
         
         const rolesList = document.getElementById('roles-list');
         
+        // Check if we have any roles
         if (roles.length === 0) {
-            rolesList.innerHTML = '<p style="text-align: center; color: var(--text-secondary); padding: 2rem;">No groups configured yet. Create one to map SCIM groups to policies.</p>';
+            rolesList.innerHTML = '<p style="text-align: center; color: var(--text-secondary); padding: 2rem;">No roles configured yet. Create one to map SRAM groups to policies.</p>';
             return;
         }
         
         // Fetch SCIM groups to get displayName and id
         let scimGroupsMap = {};
         try {
-            const scimResponse = await apiCall('/settings/scim-groups');
+            const scimResponse = await apiCall('/settings/sram-groups');
             const scimGroups = scimResponse.Resources || [];
-            // Map by SCIM group ID (not displayName) for accurate lookup
             scimGroupsMap = scimGroups.reduce((map, group) => {
                 map[group.id] = {
                     id: group.id,
-                    displayName: group.displayName
+                    displayName: group.displayName || group.name,
+                    shortName: group.shortName
                 };
                 return map;
             }, {});
@@ -1440,10 +2145,12 @@ async function loadRoles() {
             console.error('Failed to load SCIM groups for display:', error);
         }
         
-        rolesList.innerHTML = roles.map(role => {
-            // Use role.scim_id directly (already provided by backend)
+        let html = '';
+        
+        // Display roles
+        html += roles.map(role => {
             const scimInfo = role.scim_id ? scimGroupsMap[role.scim_id] : null;
-            const displayName = role.name;  // Backend already sets this to SCIM displayName
+            const displayName = scimInfo?.displayName || role.name;
             const scimId = role.scim_id || 'Unknown';
             
             return `
@@ -1454,7 +2161,8 @@ async function loadRoles() {
                         ${getBackendStatusBadge(role.backend_status)}
                     </h4>
                     <div class="credential-meta" style="font-size: 0.75rem; color: var(--text-secondary);">
-                        SCIM ID: ${escapeHtml(scimId)}
+                        SRAM Group ID: ${escapeHtml(scimId)}
+                        ${scimInfo?.shortName ? ` (${escapeHtml(scimInfo.shortName)})` : ''}
                     </div>
                     ${role.description ? `<div class="credential-meta" style="margin-top: 0.25rem;">${escapeHtml(role.description)}</div>` : ''}
                     <div class="credential-meta" style="margin-top: 0.5rem;">
@@ -1482,6 +2190,10 @@ async function loadRoles() {
         `;
         }).join('');
         
+        rolesList.innerHTML = html;
+        
+        // Update admin UI for newly created elements
+        updateAdminUI();
     } catch (error) {
         document.getElementById('roles-list').innerHTML = 
             '<p style="text-align: center; color: var(--error-color); padding: 2rem;">Failed to load groups</p>';
@@ -1525,54 +2237,37 @@ async function showCreateGroupModal() {
 
 async function loadAvailableSCIMGroups() {
     try {
+        // Small delay to ensure role deletion has propagated
+        await new Promise(resolve => setTimeout(resolve, 500));
+
         // Get existing roles (SCIM groups with assigned policies) to filter them out
         const rolesResponse = await apiCall('/settings/roles');
         const existingScimIds = (rolesResponse.groups || []).map(r => r.scim_id).filter(id => id);
-        
-        // Get SCIM groups
-        const groupsResponse = await apiCall('/settings/scim-groups');
+
+        // Get SCIM groups from SRAM
+        const groupsResponse = await apiCall('/settings/sram-groups');
         const scimGroups = groupsResponse.Resources || [];
-        
-        // Filter out groups that already have policies (compare by SCIM ID)
+
+        // Filter out groups that already have roles assigned
         const availableGroups = scimGroups.filter(g => !existingScimIds.includes(g.id));
-        
+
         const select = document.getElementById('group-name-select');
-        select.innerHTML = '<option value="">-- Select a SCIM group --</option>';
-        
+        select.innerHTML = '<option value="">-- Select an SRAM group --</option>';
+
         if (availableGroups.length === 0) {
-            select.innerHTML += '<option value="" disabled>No available SCIM groups (all groups already configured)</option>';
+            select.innerHTML += '<option value="" disabled>No available SRAM groups (all groups already have roles)</option>';
         } else {
             availableGroups.forEach(group => {
-                select.innerHTML += `<option value="${escapeHtml(group.displayName)}">${escapeHtml(group.displayName)}</option>`;
+                const name = group.displayName || group.name;
+                const shortName = group.shortName ? ` (${group.shortName})` : '';
+                // Store both the display name and the ID in data attributes
+                select.innerHTML += `<option value="${escapeHtml(group.id)}" data-name="${escapeHtml(name)}">${escapeHtml(name)}${shortName}</option>`;
             });
         }
     } catch (error) {
-        console.error('Failed to load SCIM groups:', error);
+        console.error('Failed to load SRAM groups:', error);
         const select = document.getElementById('group-name-select');
-        select.innerHTML = '<option value="">Failed to load SCIM groups</option>';
-    }
-}
-
-async function editRole(scimId) {
-    try {
-        const response = await apiCall(`/settings/roles/${scimId}`);
-        const role = response.group;
-        
-        document.getElementById('group-modal-title').textContent = `Edit Role: ${role.name}`;
-        document.getElementById('group-name-select').innerHTML = `<option value="${escapeHtml(role.name)}">${escapeHtml(role.name)}</option>`;
-        document.getElementById('group-name-select').value = role.name;
-        document.getElementById('group-name-select').disabled = true;
-        document.getElementById('group-description').value = role.description || '';
-        
-        state.editingRole = scimId;
-        state.roleSelectedPolicies = role.policies || [];
-        
-        // Load available policies and pre-select assigned ones
-        await loadPoliciesForGroupModal();
-        
-        document.getElementById('group-modal').style.display = 'flex';
-    } catch (error) {
-        showToast('Failed to load group: ' + error.message, 'error');
+        select.innerHTML = '<option value="">Failed to load SRAM groups</option>';
     }
 }
 
@@ -1630,17 +2325,18 @@ function toggleRolePolicy(policyName, isChecked) {
 }
 
 async function saveRole() {
-    const name = document.getElementById('group-name-select').value.trim();
+    const selectEl = document.getElementById('group-name-select');
+    const scimGroupId = selectEl.value.trim();
     const description = document.getElementById('group-description').value.trim();
     const policies = state.roleSelectedPolicies || [];
     
-    if (!name) {
-        showToast('Please select a group name', 'error');
+    if (!scimGroupId) {
+        showToast('Please select an SRAM group', 'error');
         return;
     }
     
     if (policies.length === 0) {
-        showToast('Please select at least one policy for this group', 'error');
+        showToast('Please select at least one policy for this role', 'error');
         return;
     }
     
@@ -1649,28 +2345,18 @@ async function saveRole() {
         const method = isEdit ? 'PUT' : 'POST';
         const endpoint = isEdit ? `/settings/roles/${state.editingRole}` : '/settings/roles';
         
-        // For new roles, we need to find the SCIM group ID from the display name
+        // For new roles, we use the SCIM group ID directly from the select value
         let requestBody;
         if (isEdit) {
-            // For edit, just send name, description, policies
+            // For edit, just send description and policies (SCIM ID doesn't change)
             requestBody = {
-                name,
                 description,
                 policies
             };
         } else {
-            // For create, look up the SCIM ID from the selected display name
-            const groupsResponse = await apiCall('/settings/scim-groups');
-            const scimGroups = groupsResponse.Resources || [];
-            const selectedGroup = scimGroups.find(g => g.displayName === name);
-            
-            if (!selectedGroup) {
-                showToast('Selected SCIM group not found', 'error');
-                return;
-            }
-            
+            // For create, send the SCIM group ID
             requestBody = {
-                scim_group_id: selectedGroup.id,
+                scim_group_id: scimGroupId,
                 description,
                 policies
             };
@@ -1725,6 +2411,59 @@ async function deleteRole(scimId) {
     }
 }
 
+async function editRole(scimId) {
+    try {
+        // Fetch the current group data
+        const response = await apiCall(`/settings/roles/${scimId}`);
+        const group = response.group;
+        
+        // Populate the modal with existing data
+        document.getElementById('group-modal-title').textContent = 'Edit Role';
+        
+        // Load available SCIM groups first, then select the current one
+        await loadAvailableSCIMGroups();
+        
+        // Disable the group selection for editing (can't change the group)
+        const selectEl = document.getElementById('group-name-select');
+        selectEl.disabled = true;
+        
+        // Add the current group to the select if it's not already there
+        let optionExists = false;
+        for (let i = 0; i < selectEl.options.length; i++) {
+            if (selectEl.options[i].value === scimId) {
+                optionExists = true;
+                selectEl.selectedIndex = i;
+                break;
+            }
+        }
+        
+        // If the current group is not in the available options (shouldn't happen for editing), add it
+        if (!optionExists) {
+            const scimInfo = state.scimGroupsMap?.[scimId];
+            const displayName = scimInfo?.displayName || group.name || scimId;
+            selectEl.innerHTML += `<option value="${escapeHtml(scimId)}">${escapeHtml(displayName)}</option>`;
+            selectEl.value = scimId;
+        }
+        
+        document.getElementById('group-description').value = group.description || '';
+        
+        // Set selected policies
+        state.roleSelectedPolicies = group.policies || [];
+        
+        // Update policy checkboxes
+        await loadPoliciesForGroupModal();
+        
+        // Set editing state
+        state.editingRole = scimId;
+        
+        // Show the modal
+        showModal('group-modal');
+        
+    } catch (error) {
+        showToast('Failed to load role for editing: ' + error.message, 'error');
+    }
+}
+
 // Expose policy and group functions to global scope
 window.viewPolicy = viewPolicy;
 window.editPolicy = editPolicy;
@@ -1774,6 +2513,586 @@ function formatBytes(bytes) {
     const sizes = ['Bytes', 'KB', 'MB', 'GB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
     return Math.round((bytes / Math.pow(k, i)) * 100) / 100 + ' ' + sizes[i];
+}
+
+// ===== TENANT MANAGEMENT =====
+
+// Helper function to generate health status badge
+function getHealthStatusBadge(health) {
+    if (!health) {
+        return '<span class="badge badge-secondary" style="font-size: 0.75rem;">Unknown</span>';
+    }
+    
+    if (health.healthy) {
+        return '<span class="badge badge-success" style="font-size: 0.75rem;">Healthy</span>';
+    }
+    
+    return '<span class="badge badge-error" style="font-size: 0.75rem;">Unhealthy</span>';
+}
+
+// Helper function to generate detailed health info
+function getTenantHealthDetails(health) {
+    if (!health) return '';
+    
+    const details = [];
+    
+    if (health.sram_configured) {
+        const adminIcon = health.admin_accepted 
+            ? '<span style="color: var(--success-color);">✓</span>' 
+            : '<span style="color: var(--error-color);">✗</span>';
+        details.push(`${adminIcon} Admin: ${health.admin_accepted ? 'Accepted' : 'Pending'}`);
+    }
+    
+    const iamIcon = health.iam_working 
+        ? '<span style="color: var(--success-color);">✓</span>' 
+        : health.sram_configured && !health.iam_working 
+        ? '<span style="color: var(--warning-color);">⚠</span>'
+        : '<span style="color: var(--text-secondary);">-</span>';
+    details.push(`${iamIcon} IAM: ${health.iam_working ? 'Working' : 'Not Configured'}`);
+    
+    if (details.length > 0) {
+        return `<div class="tenant-health-details" style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 8px; display: flex; gap: 15px;">${details.join('')}</div>`;
+    }
+    
+    return '';
+}
+
+async function loadTenants() {
+    const listEl = document.getElementById('tenants-list');
+    listEl.innerHTML = '<div class="empty-state">Loading tenants...</div>';
+
+    try {
+        // Fetch tenants and health status in parallel
+        const [tenantsResponse, healthResponse] = await Promise.all([
+            fetch(`${CONFIG.gatewayUrl}/tenants`, {
+                method: 'GET',
+                headers: getAuthHeaders()
+            }),
+            fetch(`${CONFIG.gatewayUrl}/health`)
+        ]);
+        
+        if (!tenantsResponse.ok) {
+            throw new Error('Failed to load tenants');
+        }
+        
+        const data = await tenantsResponse.json();
+        const tenants = data.tenants || [];
+        
+        // Get health data if available
+        let healthData = {};
+        if (healthResponse.ok) {
+            const health = await healthResponse.json();
+            healthData = health.tenant_health || {};
+        }
+
+        if (tenants.length === 0) {
+            listEl.innerHTML = `
+                <div class="empty-state">
+                    <svg width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                        <path d="M3 7v10a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2z"></path>
+                        <path d="M8 5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2H8V5z"></path>
+                    </svg>
+                    <p>No tenants configured</p>
+                    <p style="font-size: 0.875rem; margin-top: 0.5rem;">Create your first tenant to get started</p>
+                </div>
+            `;
+        } else {
+            listEl.innerHTML = tenants.map(tenant => {
+                const health = healthData[tenant.name];
+                const healthStatus = getHealthStatusBadge(health);
+                
+                return `
+                <div class="tenant-card">
+                    <div class="tenant-info">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <h4>${tenant.name}</h4>
+                            ${healthStatus}
+                        </div>
+                        <div class="tenant-meta">${tenant.description || 'No description'}</div>
+                        ${health ? getTenantHealthDetails(health) : ''}
+                    </div>
+                    <div class="tenant-actions">
+                        <button class="btn-icon" onclick="selectTenant('${tenant.name}')" title="Access Tenant">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                <path d="M9 18l6-6-6-6"/>
+                            </svg>
+                        </button>
+                        <button class="btn-icon" onclick="inspectTenant('${tenant.name}')" title="View Details">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                                <circle cx="12" cy="12" r="3"></circle>
+                            </svg>
+                        </button>
+                        <button class="btn-icon global-admin-only" onclick="editTenant('${tenant.name}')" title="Edit">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"></path>
+                                <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"></path>
+                            </svg>
+                        </button>
+                        <button class="btn-icon btn-danger global-admin-only" onclick="deleteTenant('${tenant.name}')" title="Delete">
+                            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                                <polyline points="3 6 5 6 21 6"></polyline>
+                                <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                            </svg>
+                        </button>
+                    </div>
+                </div>`
+            }).join('');
+        }
+        
+        // Update admin UI for newly created elements
+        updateAdminUI();
+    } catch (error) {
+        listEl.innerHTML = `<div class="empty-state">Failed to load tenants: ${error.message}</div>`;
+    }
+}
+
+function showCreateTenantModal() {
+    const modal = document.getElementById('tenant-modal');
+    document.getElementById('tenant-modal-title').textContent = 'Create New Tenant';
+    document.getElementById('tenant-modal-name').value = '';
+    document.getElementById('tenant-modal-name').disabled = false;
+    document.getElementById('tenant-description').value = '';
+    document.getElementById('tenant-admin-email').value = '';
+    document.getElementById('tenant-iam-access-key').value = '';
+    document.getElementById('tenant-iam-secret-key').value = '';
+    document.getElementById('confirm-save-tenant').textContent = 'Create Tenant';
+
+    state.editingTenant = null;
+    modal.style.display = 'flex';
+}
+
+async function inspectTenant(name) {
+    try {
+        // For now, we'll fetch basic tenant info from the list endpoint
+        // In the future, we might want a dedicated endpoint for tenant details
+        // Always call /tenants at root level (not tenant-prefixed)
+        const response = await fetch(`${CONFIG.gatewayUrl}/tenants`, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${state.token}`,
+                'Content-Type': 'application/json'
+            }
+        });
+        
+        if (!response.ok) {
+            throw new Error('Failed to load tenant details');
+        }
+        
+        const data = await response.json();
+        const tenant = data.tenants.find(t => t.name === name);
+
+        if (!tenant) {
+            throw new Error('Tenant not found');
+        }
+
+        document.getElementById('inspect-tenant-name').textContent = tenant.name;
+        document.getElementById('inspect-tenant-description').textContent = tenant.description || 'No description';
+        document.getElementById('inspect-tenant-admin-email').textContent = 'Not available'; // Will be populated when we add detail endpoint
+        document.getElementById('inspect-tenant-iam-access-key').textContent = '••••••••••••••••';
+        document.getElementById('inspect-tenant-iam-secret-key').textContent = '••••••••••••••••••••••••••••••••';
+
+        // Reset secret visibility
+        state.tenantSecretKeyVisible = false;
+        const secretKeyEl = document.getElementById('inspect-tenant-iam-secret-key');
+        secretKeyEl.textContent = '••••••••••••••••••••••••••••••••';
+        const iconEl = document.getElementById('tenant-secret-eye-icon');
+        iconEl.innerHTML = '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle>';
+
+        // Fetch SRAM invitation status
+        await loadSRAMInvitationStatus(name);
+
+        showModal('inspect-tenant-modal');
+    } catch (error) {
+        console.error('Failed to load tenant details:', error);
+        showToast('Failed to load tenant details: ' + error.message, 'error');
+    }
+}
+
+async function loadSRAMInvitationStatus(tenantName) {
+    const container = document.getElementById('sram-invitation-status');
+    if (!container) {
+        console.error('SRAM invitation status container not found');
+        return;
+    }
+
+    try {
+        const response = await fetch(`${CONFIG.gatewayUrl}/tenants/${tenantName}/sram-invitations`, {
+            headers: getAuthHeaders()
+        });
+
+        if (!response.ok) {
+            if (response.status === 400) {
+                // SRAM not enabled
+                container.innerHTML = '<p class="text-muted">SRAM integration is not enabled</p>';
+                return;
+            }
+            throw new Error('Failed to load SRAM invitation status');
+        }
+
+        const data = await response.json();
+
+        if (!data.invitations || data.invitations.length === 0) {
+            container.innerHTML = '<p class="text-muted">No SRAM invitations sent</p>';
+            return;
+        }
+
+        const invitationsHTML = data.invitations.map(invitation => {
+            const statusClass = invitation.status === 'accepted' ? 'success' : 
+                              invitation.status === 'declined' ? 'error' : 'warning';
+            const statusText = invitation.status.charAt(0).toUpperCase() + invitation.status.slice(1);
+            
+            return `
+                <div class="invitation-item">
+                    <div class="invitation-email">${invitation.email}</div>
+                    <span class="badge badge-${statusClass}">${statusText}</span>
+                </div>
+            `;
+        }).join('');
+
+        container.innerHTML = `
+            <div class="invitation-list">
+                ${invitationsHTML}
+            </div>
+        `;
+    } catch (error) {
+        console.error('Failed to load SRAM invitation status:', error);
+        container.innerHTML = '<p class="text-error">Failed to load invitation status</p>';
+    }
+}
+
+async function editTenant(name) {
+    try {
+        // Fetch detailed tenant information
+        const response = await fetch(`${CONFIG.gatewayUrl}/tenants/${name}`, {
+            method: 'GET',
+            headers: getAuthHeaders()
+        });
+        
+        if (!response.ok) {
+            throw new Error('Failed to load tenant details');
+        }
+        
+        const tenant = await response.json();
+
+        document.getElementById('tenant-modal-title').textContent = `Edit Tenant: ${name}`;
+        document.getElementById('tenant-modal-name').value = tenant.name;
+        document.getElementById('tenant-modal-name').disabled = true; // Don't allow name changes
+        document.getElementById('tenant-description').value = tenant.description || '';
+        document.getElementById('tenant-admin-email').value = tenant.admin_emails && tenant.admin_emails.length > 0 ? tenant.admin_emails.join(' ') : '';
+        
+        // Display admin emails (read-only for reference)
+        const adminEmailsDisplay = document.getElementById('tenant-admin-emails-display');
+        if (tenant.admin_emails && tenant.admin_emails.length > 0) {
+            adminEmailsDisplay.innerHTML = tenant.admin_emails.map(email => 
+                `<div class="admin-email-item">${email}</div>`
+            ).join('');
+        } else {
+            adminEmailsDisplay.innerHTML = '<div class="form-hint">No admin emails configured</div>';
+        }
+        
+        // Display IAM credentials info
+        if (tenant.has_iam_credentials) {
+            document.getElementById('tenant-iam-access-key').placeholder = tenant.iam_access_key || 'AKIA... (leave empty to keep existing)';
+            document.getElementById('tenant-iam-secret-key').placeholder = '(leave empty to keep existing)';
+            document.getElementById('tenant-iam-current-value').textContent = 
+                `Current: ${tenant.iam_access_key} / ${tenant.iam_secret_key_masked}`;
+        } else {
+            document.getElementById('tenant-iam-access-key').placeholder = 'AKIA... (optional)';
+            document.getElementById('tenant-iam-secret-key').placeholder = '(optional)';
+            document.getElementById('tenant-iam-current-value').textContent = 'No IAM credentials configured';
+        }
+        
+        // Clear input fields (user must re-enter to change)
+        document.getElementById('tenant-iam-access-key').value = '';
+        document.getElementById('tenant-iam-secret-key').value = '';
+        
+        document.getElementById('confirm-save-tenant').textContent = 'Update Tenant';
+
+        state.editingTenant = name;
+        
+        // Load SRAM invitation status if available
+        await loadSRAMInvitations(name);
+        
+        document.getElementById('tenant-modal').style.display = 'flex';
+    } catch (error) {
+        console.error('Failed to load tenant for editing:', error);
+        showToast('Failed to load tenant: ' + error.message, 'error');
+    }
+}
+
+async function loadSRAMInvitations(tenantName) {
+    try {
+        const response = await fetch(`${CONFIG.gatewayUrl}/tenants/${tenantName}/sram-invitations`, {
+            method: 'GET',
+            headers: {
+                'Authorization': `Bearer ${state.token}`,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        if (!response.ok) {
+            // If SRAM is not enabled or error, hide the section
+            document.getElementById('sram-invitations-section').style.display = 'none';
+            return;
+        }
+
+        const data = await response.json();
+        
+        // Show invitations section even if there are no invitations
+        // This ensures refresh buttons are always available for tenants with SRAM enabled
+        document.getElementById('sram-invitations-section').style.display = 'block';
+        
+        // Render invitations or show "no invitations" message
+        const listEl = document.getElementById('sram-invitations-list');
+        if (!data.invitations || data.invitations.length === 0) {
+            listEl.innerHTML = '<div class="form-hint">No invitations found. Click "Refresh Status" to check for new invitations.</div>';
+            state.currentInvitations = [];
+        } else {
+            listEl.innerHTML = data.invitations.map(inv => {
+                const statusBadge = inv.status === 'accepted' 
+                    ? '<span class="badge badge-success">Accepted</span>'
+                    : inv.status === 'pending'
+                    ? '<span class="badge badge-warning">Pending</span>'
+                    : '<span class="badge badge-error">Declined</span>';
+                
+                const usernameDisplay = inv.sram_username 
+                    ? `<div class="invitation-username">SRAM Username: ${inv.sram_username}</div>`
+                    : '';
+                
+                const extraClass = inv.status === 'accepted' ? 'invitation-accepted' : '';
+                
+                return `
+                    <div class="invitation-item ${extraClass}" data-invitation-id="${inv.id}" data-email="${inv.email}">
+                        <div>
+                            <div class="invitation-email">${inv.email}</div>
+                            ${usernameDisplay}
+                        </div>
+                        <div>${statusBadge}</div>
+                    </div>
+                `;
+            }).join('');
+
+            // Store invitations for later reference
+            state.currentInvitations = data.invitations;
+        }
+    } finally {
+        // Re-enable buttons after loading
+        document.getElementById('refresh-invitations').disabled = false;
+        document.getElementById('sync-sram-admins').disabled = false;
+    }
+}
+
+async function refreshInvitationStatus() {
+    if (!state.editingTenant) {
+        return;
+    }
+    
+    const btn = document.getElementById('refresh-invitations');
+    btn.disabled = true;
+    btn.textContent = 'Refreshing...';
+    
+    try {
+        await loadSRAMInvitations(state.editingTenant);
+        showToast('Invitation status refreshed', 'success');
+    } catch (error) {
+        showToast('Failed to refresh invitation status: ' + error.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Refresh Status';
+    }
+}
+
+async function syncSRAMAdmins() {
+    if (!state.editingTenant) {
+        return;
+    }
+    
+    const btn = document.getElementById('sync-sram-admins');
+    btn.disabled = true;
+    btn.textContent = 'Syncing...';
+    
+    try {
+        const response = await fetch(`${CONFIG.gatewayUrl}/tenants/${state.editingTenant}/sync-sram-admins`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${state.token}`,
+                'Content-Type': 'application/json'
+            }
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to sync SRAM admins');
+        }
+
+        const data = await response.json();
+        
+        if (data.synced === 0) {
+            showToast(data.message || 'No new admins to sync', 'info');
+        } else {
+            showToast(`Synced ${data.synced} new admin(s): ${data.new_admins.join(', ')}`, 'success');
+        }
+        
+        // Reload invitation status to show updated state
+        await loadSRAMInvitations(state.editingTenant);
+        
+    } catch (error) {
+        showToast('Failed to sync SRAM admins: ' + error.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Sync Accepted Admins to Config';
+    }
+}
+
+
+async function handleSaveTenant() {
+    const name = document.getElementById('tenant-modal-name').value.trim();
+    const description = document.getElementById('tenant-description').value.trim();
+    const adminEmailsText = document.getElementById('tenant-admin-email').value.trim();
+    const iamAccessKey = document.getElementById('tenant-iam-access-key').value.trim();
+    const iamSecretKey = document.getElementById('tenant-iam-secret-key').value.trim();
+
+    // Parse admin emails from input field (space-separated)
+    const adminEmails = adminEmailsText.split(/\s+/)
+        .map(email => email.trim())
+        .filter(email => email.length > 0);
+
+    if (!name) {
+        showToast('Tenant name is required', 'error');
+        return;
+    }
+
+    if (adminEmails.length === 0) {
+        showToast('At least one admin email is required', 'error');
+        return;
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    for (const email of adminEmails) {
+        if (!emailRegex.test(email)) {
+            showToast(`Invalid email format: ${email}`, 'error');
+            return;
+        }
+    }
+
+    try {
+        let response;
+        if (state.editingTenant) {
+            // Update existing tenant - use new format with admin_emails array
+            const payload = {
+                description: description,
+                admin_emails: adminEmails
+            };
+            
+            // Only include IAM keys if both are provided
+            if (iamAccessKey && iamSecretKey) {
+                payload.iam_access_key = iamAccessKey;
+                payload.iam_secret_key = iamSecretKey;
+            }
+            
+            response = await fetch(`${CONFIG.gatewayUrl}/tenants/${state.editingTenant}`, {
+                method: 'PUT',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${state.token}`
+                },
+                body: JSON.stringify(payload)
+            });
+        } else {
+            // Create new tenant - use new format with admin_emails array
+            const payload = {
+                name: name,
+                description: description,
+                admin_emails: adminEmails
+            };
+            
+            // Only include IAM keys if both are provided
+            if (iamAccessKey && iamSecretKey) {
+                payload.iam_access_key = iamAccessKey;
+                payload.iam_secret_key = iamSecretKey;
+            }
+            
+            response = await fetch(`${CONFIG.gatewayUrl}/tenants`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${state.token}`
+                },
+                body: JSON.stringify(payload)
+            });
+        }
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to save tenant');
+        }
+
+        const result = await response.json();
+        let message = `Tenant "${result.name || name}" ${state.editingTenant ? 'updated' : 'created'} successfully!`;
+        if (!iamAccessKey && !state.editingTenant) {
+            message += ' (IAM credentials can be added later)';
+        }
+        showToast(message, 'success');
+
+        hideModals();
+        loadTenants(); // Reload tenant list
+    } catch (error) {
+        console.error('Failed to save tenant:', error);
+        showToast(error.message || 'Failed to save tenant', 'error');
+    }
+}
+
+async function deleteTenant(name) {
+    if (!confirm(`Are you sure you want to delete tenant "${name}"?\n\nThis will:\n- Delete all tenant data and configuration\n- Remove all policies and roles\n- Delete all user credentials\n\nThis action cannot be undone.`)) {
+        return;
+    }
+
+    try {
+        const response = await fetch(`${CONFIG.gatewayUrl}/tenants/${name}`, {
+            method: 'DELETE',
+            headers: {
+                'Authorization': `Bearer ${state.token}`
+            }
+        });
+
+        if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.error || 'Failed to delete tenant');
+        }
+
+        showToast('Tenant deleted successfully', 'success');
+        loadTenants(); // Reload tenant list
+    } catch (error) {
+        showToast('Failed to delete tenant: ' + error.message, 'error');
+    }
+}
+
+function toggleTenantSecretKeyVisibility() {
+    const secretKeyEl = document.getElementById('inspect-tenant-iam-secret-key');
+    const iconEl = document.getElementById('tenant-secret-eye-icon');
+
+    if (!state.currentTenantSecretKey) {
+        showToast('Secret key not available', 'info');
+        return;
+    }
+
+    state.tenantSecretKeyVisible = !state.tenantSecretKeyVisible;
+
+    if (state.tenantSecretKeyVisible) {
+        // Show the actual secret key
+        secretKeyEl.textContent = state.currentTenantSecretKey;
+        secretKeyEl.style.color = '';
+        // Change icon to "eye-off"
+        iconEl.innerHTML = '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"></path><line x1="1" y1="1" x2="23" y2="23"></line>';
+    } else {
+        // Show asterisks
+        secretKeyEl.textContent = '••••••••••••••••••••••••••••••••';
+        secretKeyEl.style.color = '';
+        // Change icon to "eye"
+        iconEl.innerHTML = '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle>';
+    }
 }
 
 // User Management (Admin Only)
@@ -1838,3 +3157,10 @@ async function deleteUser(username) {
 // Expose functions to global scope for inline event handlers
 window.copyCredential = copyCredential;
 window.deleteCredential = deleteCredential;
+window.inspectTenant = inspectTenant;
+window.editTenant = editTenant;
+window.deleteTenant = deleteTenant;
+window.refreshTenantSRAM = refreshTenantSRAM;
+window.showCreateTenantModal = showCreateTenantModal;
+window.handleSaveTenant = handleSaveTenant;
+window.toggleTenantSecretKeyVisibility = toggleTenantSecretKeyVisibility;window.refreshInvitationStatus = refreshInvitationStatus;window.syncSRAMAdmins = syncSRAMAdmins;
