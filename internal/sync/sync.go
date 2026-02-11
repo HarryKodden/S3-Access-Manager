@@ -12,28 +12,30 @@ import (
 
 // SyncService synchronizes users and groups between gateway and backend
 type SyncService struct {
-	iamClient     *s3client.IAMClient
-	groupStore    *store.GroupStore
-	userStore     *store.UserStore
-	policiesDir   string
-	adminUsername string
-	logger        *logrus.Logger
+	iamClient       *s3client.IAMClient
+	groupStore      *store.GroupStore
+	userStore       *store.UserStore
+	credentialStore *store.CredentialStore
+	policiesDir     string
+	adminUsername   string
+	logger          *logrus.Logger
 }
 
 // NewSyncService creates a new sync service
-func NewSyncService(iamClient *s3client.IAMClient, groupStore *store.GroupStore, userStore *store.UserStore, policiesDir string, adminUsername string, logger *logrus.Logger) *SyncService {
+func NewSyncService(iamClient *s3client.IAMClient, groupStore *store.GroupStore, userStore *store.UserStore, credentialStore *store.CredentialStore, policiesDir string, adminUsername string, logger *logrus.Logger) *SyncService {
 	return &SyncService{
-		iamClient:     iamClient,
-		groupStore:    groupStore,
-		userStore:     userStore,
-		policiesDir:   policiesDir,
-		adminUsername: adminUsername,
-		logger:        logger,
+		iamClient:       iamClient,
+		groupStore:      groupStore,
+		userStore:       userStore,
+		credentialStore: credentialStore,
+		policiesDir:     policiesDir,
+		adminUsername:   adminUsername,
+		logger:          logger,
 	}
 }
 
 // SyncAllSCIM performs authoritative sync of all SCIM users to IAM
-func (s *SyncService) SyncAllSCIM(ctx context.Context) error {
+func (s *SyncService) SyncAllSCIM(ctx context.Context, healthRefresher func()) error {
 	if s.iamClient == nil {
 		s.logger.Debug("IAM client not configured, skipping SCIM sync")
 		return nil
@@ -66,6 +68,12 @@ func (s *SyncService) SyncAllSCIM(ctx context.Context) error {
 	}
 
 	s.logger.Info("SCIM-to-IAM sync completed")
+
+	// Trigger health refresh since SCIM data may have changed admin acceptance status
+	if healthRefresher != nil {
+		healthRefresher()
+	}
+
 	return nil
 }
 
@@ -78,8 +86,15 @@ func (s *SyncService) syncUserToIAM(ctx context.Context, user *store.SCIMUser) e
 		return fmt.Errorf("failed to create IAM user %s: %w", username, err)
 	}
 
-	// Get user's groups and resolve to policies
+	// Get user's current groups
 	userGroups := s.userStore.GetUserGroups(username)
+
+	// Clean up credentials that are no longer valid due to group membership changes
+	if err := s.cleanupInvalidCredentials(ctx, username, userGroups); err != nil {
+		s.logger.WithError(err).WithField("username", username).Error("Failed to cleanup invalid credentials")
+		// Continue with sync despite cleanup failure
+	}
+
 	policyNames := s.groupStore.GetPoliciesForGroups(userGroups)
 
 	// Handle admin user
@@ -115,6 +130,88 @@ func (s *SyncService) attachPolicyToUser(ctx context.Context, username, policyNa
 	}).Debug("Attaching policy to user (simplified)")
 
 	// TODO: Implement actual policy attachment based on backend
+	return nil
+}
+
+// cleanupInvalidCredentials removes credentials that are no longer valid due to group membership changes
+func (s *SyncService) cleanupInvalidCredentials(ctx context.Context, username string, currentUserGroups []string) error {
+	if s.credentialStore == nil {
+		return nil // No credential store configured
+	}
+
+	// Get all credentials for this user
+	credentials, err := s.credentialStore.ListByUser(username)
+	if err != nil {
+		return fmt.Errorf("failed to list credentials for user %s: %w", username, err)
+	}
+
+	// Create a set of current user groups for efficient lookup
+	userGroupSet := make(map[string]bool)
+	for _, group := range currentUserGroups {
+		userGroupSet[group] = true
+	}
+
+	var credentialsToDelete []*store.Credential
+
+	// Check each credential
+	for _, cred := range credentials {
+		valid := true
+		for _, credGroup := range cred.Groups {
+			if !userGroupSet[credGroup] {
+				valid = false
+				break
+			}
+		}
+
+		if !valid {
+			credentialsToDelete = append(credentialsToDelete, cred)
+			s.logger.WithFields(logrus.Fields{
+				"username":        username,
+				"credential_id":   cred.ID,
+				"credential_name": cred.Name,
+				"cred_groups":     cred.Groups,
+				"user_groups":     currentUserGroups,
+			}).Warn("Credential is no longer valid due to group membership changes")
+		}
+	}
+
+	// Delete invalid credentials
+	for _, cred := range credentialsToDelete {
+		// Delete from backend first
+		if s.iamClient != nil {
+			if err := s.iamClient.DeleteAccessKey(ctx, username, cred.AccessKey); err != nil {
+				s.logger.WithError(err).WithFields(logrus.Fields{
+					"username":   username,
+					"access_key": cred.AccessKey,
+					"credential": cred.Name,
+				}).Error("Failed to delete access key from backend")
+				continue // Don't delete from local store if backend deletion failed
+			}
+		}
+
+		// Delete from local store
+		if err := s.credentialStore.Delete(cred.AccessKey, username); err != nil {
+			s.logger.WithError(err).WithFields(logrus.Fields{
+				"username":   username,
+				"access_key": cred.AccessKey,
+				"credential": cred.Name,
+			}).Error("Failed to delete credential from local store")
+		} else {
+			s.logger.WithFields(logrus.Fields{
+				"username":   username,
+				"access_key": cred.AccessKey,
+				"credential": cred.Name,
+			}).Info("Deleted invalid credential due to group membership changes")
+		}
+	}
+
+	if len(credentialsToDelete) > 0 {
+		s.logger.WithFields(logrus.Fields{
+			"username":            username,
+			"credentials_deleted": len(credentialsToDelete),
+		}).Info("Completed cleanup of invalid credentials")
+	}
+
 	return nil
 }
 

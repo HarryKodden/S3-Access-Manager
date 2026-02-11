@@ -184,6 +184,11 @@ async function validateTokenAndShowDashboard() {
         localStorage.setItem('is_admin', state.actualIsAdmin.toString());
         localStorage.setItem('is_global_admin', state.isGlobalAdmin.toString());
         
+        // Remember this tenant as the last visited one
+        if (CONFIG.tenant) {
+            localStorage.setItem('last_tenant', CONFIG.tenant);
+        }
+        
         showDashboard();
         const username = state.userInfo.name || state.userInfo.email || state.userInfo.sub || 'User';
         showToast(`Welcome back ${username}!`, 'success');
@@ -226,30 +231,34 @@ async function handleOIDCCallback(code, receivedState) {
             throw new Error('PKCE verifier not found');
         }
         
-        // Discover token endpoint
-        const discovery = await discoverOIDCEndpoints(oidcConfig.issuer);
+        // Get stored redirect URI
+        const redirectUri = sessionStorage.getItem('redirect_uri');
+        console.log('Redirect URI:', redirectUri);
+        if (!redirectUri) {
+            throw new Error('Redirect URI not found');
+        }
         
-        // Exchange authorization code for tokens
-        const redirectUri = window.location.origin + (CONFIG.tenant ? `/tenant/${CONFIG.tenant}` : '') + '/callback';
-        const tokenParams = new URLSearchParams({
-            grant_type: 'authorization_code',
-            code: code,
-            redirect_uri: redirectUri,
-            client_id: oidcConfig.client_id || oidcConfig.clientId,
-            code_verifier: codeVerifier
-        });
+        // Exchange authorization code for tokens via backend
+        let endpoint = '/oidc/token';
+        if (CONFIG.tenant) {
+            endpoint = `/tenant/${CONFIG.tenant}/oidc/token`;
+        }
         
-        const tokenResponse = await fetch(discovery.token_endpoint, {
+        const tokenResponse = await fetch(`${CONFIG.gatewayUrl}${endpoint}`, {
             method: 'POST',
             headers: {
-                'Content-Type': 'application/x-www-form-urlencoded'
+                'Content-Type': 'application/json'
             },
-            body: tokenParams.toString()
+            body: JSON.stringify({
+                code: code,
+                code_verifier: codeVerifier,
+                redirect_uri: redirectUri
+            })
         });
         
         if (!tokenResponse.ok) {
             const errorData = await tokenResponse.json().catch(() => ({}));
-            throw new Error(errorData.error_description || 'Token exchange failed');
+            throw new Error(errorData.error || 'Token exchange failed');
         }
         
         const tokens = await tokenResponse.json();
@@ -313,13 +322,14 @@ async function handleOIDCCallback(code, receivedState) {
         // Clean up
         sessionStorage.removeItem('pkce_verifier');
         sessionStorage.removeItem('oauth_state');
+        sessionStorage.removeItem('redirect_uri');
         window.history.replaceState({}, document.title, window.location.pathname);
         
         // Setup event listeners
         setupEventListeners();
         
-        // Validate token and show appropriate screen (tenant selection or dashboard)
-        validateTokenAndShowDashboard();
+        // Determine where to redirect after authentication
+        await determinePostAuthDestination();
         
         // Show welcome message with username
         const username = state.userInfo.name || state.userInfo.email || state.userInfo.sub || 'User';
@@ -332,9 +342,63 @@ async function handleOIDCCallback(code, receivedState) {
         // Clean up and show login
         sessionStorage.removeItem('pkce_verifier');
         sessionStorage.removeItem('oauth_state');
+        sessionStorage.removeItem('redirect_uri');
         window.history.replaceState({}, document.title, window.location.pathname);
         showLoginScreen();
         setupEventListeners();
+    }
+}
+
+async function determinePostAuthDestination() {
+    try {
+        console.log('Determining post-authentication destination...');
+        
+        // Get list of accessible tenants
+        const tenantData = await apiCall('/tenants');
+        const tenants = tenantData.tenants || [];
+        const isGlobalAdmin = tenantData.is_global_admin || false;
+        
+        console.log('Tenant data:', { tenants: tenants.length, isGlobalAdmin });
+        
+        // Store global admin status
+        state.isGlobalAdmin = isGlobalAdmin;
+        localStorage.setItem('is_global_admin', isGlobalAdmin ? 'true' : 'false');
+        
+        // Check if user has a last visited tenant stored
+        const lastTenant = localStorage.getItem('last_tenant');
+        
+        if (tenants.length === 0) {
+            // No tenants accessible
+            showToast('No tenants available. Please contact your administrator.', 'error');
+            showLoginScreen();
+            return;
+        }
+        
+        if (tenants.length === 1) {
+            // Only one tenant - redirect there directly
+            const tenantName = tenants[0].name;
+            console.log('Only one tenant available, redirecting to:', tenantName);
+            localStorage.setItem('last_tenant', tenantName);
+            window.location.href = `/tenant/${tenantName}/`;
+            return;
+        }
+        
+        // Multiple tenants available
+        if (lastTenant && tenants.some(t => t.name === lastTenant)) {
+            // Last tenant is still accessible - redirect there
+            console.log('Redirecting to last tenant:', lastTenant);
+            window.location.href = `/tenant/${lastTenant}/`;
+            return;
+        }
+        
+        // No valid last tenant or first time - show tenant selection
+        console.log('Multiple tenants available, showing selection screen');
+        showTenantSelectionScreen();
+        
+    } catch (error) {
+        console.error('Failed to determine post-auth destination:', error);
+        showToast('Failed to load tenant information', 'error');
+        showLoginScreen();
     }
 }
 
@@ -548,6 +612,8 @@ async function loadTenantsForSelection() {
 }
 
 function selectTenant(tenantName) {
+    // Remember this tenant as the last visited one
+    localStorage.setItem('last_tenant', tenantName);
     // Redirect to the selected tenant
     window.location.href = `/tenant/${tenantName}/`;
 }
@@ -985,7 +1051,8 @@ async function handleLogin() {
         sessionStorage.setItem('oauth_state', state);
         
         // Build authorization URL
-        const redirectUri = window.location.origin + (CONFIG.tenant ? `/tenant/${CONFIG.tenant}` : '') + '/callback';
+        const redirectUri = window.location.origin + '/redirect_uri';
+        sessionStorage.setItem('redirect_uri', redirectUri);
         const authParams = new URLSearchParams({
             client_id: clientId,
             redirect_uri: redirectUri,

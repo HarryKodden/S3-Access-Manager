@@ -481,7 +481,7 @@ func (a *Authenticator) extractGroups(claims map[string]interface{}) []string {
 
 	// Fallback: try common group claim names
 	if len(groups) == 0 {
-		for _, claimName := range []string{"groups", "roles", "group", "role"} {
+		for _, claimName := range []string{"groups", "roles", "group", "role", "eduperson_entitlement"} {
 			if groupsValue, ok := claims[claimName]; ok {
 				switch v := groupsValue.(type) {
 				case []interface{}:

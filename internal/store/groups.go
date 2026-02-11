@@ -29,8 +29,16 @@ type GroupStore struct {
 
 // NewGroupStore creates a new group store
 func NewGroupStore(dataDir string, logger *logrus.Logger) (*GroupStore, error) {
+	logger.WithField("dataDir", dataDir).WithField("dataDirLen", len(dataDir)).Debug("Creating group store with data directory")
+
+	if dataDir == "" {
+		logger.Error("dataDir is empty")
+		return nil, fmt.Errorf("dataDir cannot be empty")
+	}
+
 	// Ensure data directory exists
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		logger.WithError(err).WithField("dataDir", dataDir).Error("Failed to create groups directory")
 		return nil, fmt.Errorf("failed to create groups directory: %w", err)
 	}
 

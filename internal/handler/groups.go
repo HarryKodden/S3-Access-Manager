@@ -192,29 +192,6 @@ func (h *GroupHandler) ListRoles(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"groups": groupsWithStatus})
 }
 
-// ListGroups returns all SCIM groups
-func (h *GroupHandler) ListGroups(c *gin.Context) {
-	scimGroups := h.userStore.GetAllGroups()
-
-	type SCIMGroupResponse struct {
-		ID          string `json:"id"`
-		DisplayName string `json:"displayName"`
-		MemberCount int    `json:"memberCount"`
-	}
-
-	var response []SCIMGroupResponse
-	for _, group := range scimGroups {
-		response = append(response, SCIMGroupResponse{
-			ID:          group.ID,
-			DisplayName: group.DisplayName,
-			MemberCount: len(group.Members),
-		})
-	}
-
-	h.logger.WithField("count", len(response)).Debug("Listed all SCIM groups")
-	c.JSON(http.StatusOK, gin.H{"Resources": response})
-}
-
 // combineGroupPolicies combines policy documents from multiple policies into one
 func (h *GroupHandler) combineGroupPolicies(policyNames []string) (map[string]interface{}, error) {
 	combinedStatements := []map[string]interface{}{}

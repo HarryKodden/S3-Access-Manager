@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/sirupsen/logrus"
@@ -121,7 +122,7 @@ func (s *UserStore) loadUsers() error {
 	}
 
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+		if entry.IsDir() {
 			continue
 		}
 
@@ -164,7 +165,7 @@ func (s *UserStore) loadGroups() error {
 	}
 
 	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+		if entry.IsDir() {
 			continue
 		}
 
@@ -175,11 +176,35 @@ func (s *UserStore) loadGroups() error {
 			continue
 		}
 
-		var group SCIMGroup
-		if err := json.Unmarshal(data, &group); err != nil {
+		var rawGroup map[string]interface{}
+		if err := json.Unmarshal(data, &rawGroup); err != nil {
 			s.logger.WithError(err).WithField("file", entry.Name()).Warn("Failed to parse group file")
 			continue
 		}
+
+		// Extract extensions
+		extensions := make(map[string]interface{})
+		for key, value := range rawGroup {
+			if strings.HasPrefix(key, "urn:") {
+				extensions[key] = value
+				delete(rawGroup, key)
+			}
+		}
+
+		// Marshal back without extensions
+		cleanData, err := json.Marshal(rawGroup)
+		if err != nil {
+			s.logger.WithError(err).WithField("file", entry.Name()).Warn("Failed to marshal clean group data")
+			continue
+		}
+
+		var group SCIMGroup
+		if err := json.Unmarshal(cleanData, &group); err != nil {
+			s.logger.WithError(err).WithField("file", entry.Name()).Warn("Failed to parse clean group file")
+			continue
+		}
+
+		group.Extensions = extensions
 
 		s.groups[group.ID] = &group
 		s.logger.WithFields(logrus.Fields{
@@ -270,6 +295,7 @@ func (s *UserStore) GetUserGroups(userName string) []string {
 	}
 	var groups []string
 	for _, groupRef := range user.Groups {
+		// Return the SCIM group ID directly
 		groups = append(groups, groupRef.Value)
 	}
 	return groups

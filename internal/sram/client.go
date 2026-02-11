@@ -105,6 +105,7 @@ type CollaborationResponse struct {
 	Name        string                    `json:"name"`
 	ShortName   string                    `json:"short_name"`
 	Description string                    `json:"description"`
+	GlobalURN   string                    `json:"global_urn"`
 	CreatedAt   FlexibleTime              `json:"created_at"`
 	Memberships []CollaborationMembership `json:"collaboration_memberships,omitempty"`
 	Groups      []CollaborationGroup      `json:"groups,omitempty"`
@@ -564,4 +565,23 @@ func (c *Client) DeleteCollaboration(collaborationIdentifier string) error {
 	}
 
 	return nil
+}
+
+// GetCollaborationGlobalURN retrieves the global URN for a collaboration
+// This method fetches collaboration data from the API
+func (c *Client) GetCollaborationGlobalURN(collaborationIdentifier string) (string, error) {
+	// Get collaboration data
+	collaboration, err := c.GetCollaboration(collaborationIdentifier)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch collaboration %s: %w", collaborationIdentifier, err)
+	}
+
+	// Return the global URN from the collaboration
+	if collaboration.GlobalURN != "" {
+		log.Printf("[SRAM] Found global URN '%s' for collaboration %s", collaboration.GlobalURN, collaborationIdentifier)
+		return collaboration.GlobalURN, nil
+	}
+
+	log.Printf("[SRAM] No global URN found in collaboration %s", collaborationIdentifier)
+	return "", fmt.Errorf("no global URN found in collaboration %s", collaborationIdentifier)
 }

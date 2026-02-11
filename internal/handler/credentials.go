@@ -1168,12 +1168,7 @@ func (h *CredentialHandler) combineGroupPolicies(policyNames []string) (map[stri
 
 // isAdmin checks if the user has admin group
 func (h *CredentialHandler) isAdmin(userInfo *auth.UserInfo) bool {
-	for _, group := range userInfo.Groups {
-		if group == "admin" {
-			return true
-		}
-	}
-	return false
+	return userInfo.Role == auth.UserRoleGlobalAdmin || userInfo.Role == auth.UserRoleTenantAdmin
 }
 
 // cleanupPartialCredential removes any partially created resources if credential creation fails

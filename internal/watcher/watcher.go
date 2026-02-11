@@ -12,16 +12,17 @@ import (
 
 // SyncService interface for triggering syncs
 type SyncService interface {
-	SyncAllSCIM(ctx context.Context) error
+	SyncAllSCIM(ctx context.Context, healthRefresher func()) error
 }
 
 // FileWatcher watches directories for changes and triggers sync operations
 type FileWatcher struct {
-	watcher     *fsnotify.Watcher
-	syncService SyncService
-	logger      *logrus.Logger
-	debouncer   *Debouncer
-	watchedDirs []string
+	watcher         *fsnotify.Watcher
+	syncService     SyncService
+	logger          *logrus.Logger
+	debouncer       *Debouncer
+	watchedDirs     []string
+	healthRefresher func() // Callback to refresh health status
 }
 
 // Debouncer prevents rapid successive syncs by batching events
@@ -56,17 +57,18 @@ func (d *Debouncer) Trigger() {
 }
 
 // NewFileWatcher creates a new file watcher
-func NewFileWatcher(syncService SyncService, logger *logrus.Logger) (*FileWatcher, error) {
+func NewFileWatcher(syncService SyncService, logger *logrus.Logger, healthRefresher func()) (*FileWatcher, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
 
 	fw := &FileWatcher{
-		watcher:     watcher,
-		syncService: syncService,
-		logger:      logger,
-		watchedDirs: []string{},
+		watcher:         watcher,
+		syncService:     syncService,
+		logger:          logger,
+		healthRefresher: healthRefresher,
+		watchedDirs:     []string{},
 	}
 
 	// Create debouncer with 2 second delay to batch rapid changes
@@ -141,7 +143,7 @@ func (fw *FileWatcher) triggerSync() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	if err := fw.syncService.SyncAllSCIM(ctx); err != nil {
+	if err := fw.syncService.SyncAllSCIM(ctx, fw.healthRefresher); err != nil {
 		fw.logger.WithError(err).Error("Failed to sync SCIM data after file change")
 	} else {
 		fw.logger.Info("Successfully synced SCIM data after file change")

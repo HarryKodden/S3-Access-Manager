@@ -36,12 +36,15 @@ COPY --from=builder /app/s3-gateway .
 # Copy example config
 COPY config.example.yaml ./config.example.yaml
 
+# Create tenants directory
+RUN mkdir -p /app/tenants
+
 # Expose port
-EXPOSE 9000
+EXPOSE 8080 9090
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-  CMD wget --no-verbose --tries=1 --spider http://localhost:9000/health || exit 1
+  CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
 
 # Run the application
 ENTRYPOINT ["./s3-gateway"]

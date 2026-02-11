@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -180,6 +181,11 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("failed to load SRAM environment variables: %w", err)
 	}
 
+	// Override global admins from environment variables if present
+	if err := loadGlobalAdminsEnvVars(&cfg); err != nil {
+		return nil, fmt.Errorf("failed to load global admins environment variables: %w", err)
+	}
+
 	// Auto-discover tenants from ./data directory
 	if err := discoverTenants(&cfg); err != nil {
 		return nil, fmt.Errorf("failed to discover tenants: %w", err)
@@ -206,7 +212,7 @@ func Load(path string) (*Config, error) {
 	for i := range cfg.Tenants {
 		tenant := &cfg.Tenants[i]
 		if tenant.DataDir == "" {
-			tenant.DataDir = fmt.Sprintf("./data/tenants/%s", tenant.Name)
+			tenant.DataDir = fmt.Sprintf("/app/data/tenants/%s", tenant.Name)
 		}
 		if tenant.Policies.Directory == "" {
 			tenant.Policies.Directory = fmt.Sprintf("%s/policies", tenant.DataDir)
@@ -232,7 +238,7 @@ func Load(path string) (*Config, error) {
 
 // discoverTenants auto-discovers tenants from the ./data directory
 func discoverTenants(cfg *Config) error {
-	dataDir := "./data/tenants"
+	dataDir := "/app/data/tenants"
 
 	// Check if tenants directory exists
 	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
@@ -435,9 +441,22 @@ func loadAdminEnvVars(tenantCfg *TenantConfig) error {
 	return nil
 }
 
+// loadGlobalAdminsEnvVars loads global admins from environment variables
+func loadGlobalAdminsEnvVars(cfg *Config) error {
+	if globalAdmins := os.Getenv("GLOBAL_ADMINS"); globalAdmins != "" {
+		// Parse comma-separated list of emails
+		emails := strings.Split(globalAdmins, ",")
+		for i, email := range emails {
+			emails[i] = strings.TrimSpace(email)
+		}
+		cfg.GlobalAdmins = emails
+	}
+	return nil
+}
+
 // LoadTenantConfig loads a tenant's specific configuration from data/tenants/<tenant>/config.yaml
 func LoadTenantConfig(tenantName string) (*TenantConfig, error) {
-	configPath := fmt.Sprintf("./data/tenants/%s/config.yaml", tenantName)
+	configPath := fmt.Sprintf("/app/data/tenants/%s/config.yaml", tenantName)
 
 	data, err := os.ReadFile(configPath)
 	if err != nil {
@@ -450,6 +469,26 @@ func LoadTenantConfig(tenantName string) (*TenantConfig, error) {
 	}
 
 	tenantCfg.Name = tenantName
+
+	// Apply directory defaults (same as in main config loading)
+	if tenantCfg.DataDir == "" {
+		tenantCfg.DataDir = fmt.Sprintf("/app/data/tenants/%s", tenantName)
+	}
+	if tenantCfg.Policies.Directory == "" {
+		tenantCfg.Policies.Directory = fmt.Sprintf("%s/policies", tenantCfg.DataDir)
+	}
+	if tenantCfg.Policies.CacheTTL == 0 {
+		tenantCfg.Policies.CacheTTL = 5 * time.Minute
+	}
+	if tenantCfg.Roles.Directory == "" {
+		tenantCfg.Roles.Directory = fmt.Sprintf("%s/roles", tenantCfg.DataDir)
+	}
+	if tenantCfg.Credentials.File == "" {
+		tenantCfg.Credentials.File = fmt.Sprintf("%s/credentials.json", tenantCfg.DataDir)
+	}
+
+	// Debug logging
+	fmt.Printf("DEBUG: LoadTenantConfig for %s: DataDir=%s, Roles.Directory=%s\n", tenantName, tenantCfg.DataDir, tenantCfg.Roles.Directory)
 
 	// Apply environment variable overrides for this tenant
 	// Note: For tenant configs, we only load admin overrides

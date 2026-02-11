@@ -11,8 +11,11 @@ import (
 // TenantContextKey is the key used to store tenant information in gin context
 const TenantContextKey = "tenant"
 
+// TenantValidator is a function that checks if a tenant name is valid
+type TenantValidator func(tenantName string) bool
+
 // TenantAuth creates a tenant authentication middleware that extracts tenant from URL path
-func TenantAuth(validTenants []string, logger *logrus.Logger) gin.HandlerFunc {
+func TenantAuth(tenantValidator TenantValidator, logger *logrus.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		path := c.Request.URL.Path
 
@@ -35,20 +38,11 @@ func TenantAuth(validTenants []string, logger *logrus.Logger) gin.HandlerFunc {
 
 		tenantName := parts[0]
 
-		// Validate tenant is in the list of valid tenants
-		valid := false
-		for _, validTenant := range validTenants {
-			if tenantName == validTenant {
-				valid = true
-				break
-			}
-		}
-
-		if !valid {
+		// Validate tenant using the validator function
+		if !tenantValidator(tenantName) {
 			logger.WithFields(logrus.Fields{
-				"path":          path,
-				"requested":     tenantName,
-				"valid_tenants": validTenants,
+				"path":      path,
+				"requested": tenantName,
 			}).Warn("Invalid tenant requested")
 			c.JSON(http.StatusNotFound, gin.H{"error": "Tenant not found"})
 			c.Abort()

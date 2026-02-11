@@ -189,7 +189,7 @@ func initializeServices(configPath string) (*ServiceContainer, context.CancelFun
 		adminUsernames[tenant.Name] = adminUsername
 
 		// Initialize sync service for this tenant
-		syncService := sync.NewSyncService(iamClient, groupStore, userStore, tenant.Policies.Directory, adminUsername, logger)
+		syncService := sync.NewSyncService(iamClient, groupStore, userStore, credStore, tenant.Policies.Directory, adminUsername, logger)
 		syncServices[tenant.Name] = syncService
 
 		logger.WithFields(logrus.Fields{
@@ -231,10 +231,15 @@ func initializeServices(configPath string) (*ServiceContainer, context.CancelFun
 		}
 	}
 
+	// Initialize health checker with 5-minute refresh interval (before file watchers)
+	healthChecker := health.NewChecker(cfg, logger, 5*time.Minute)
+
 	// Start file watchers for all tenants
 	watcherCtx, cleanupCancel := context.WithCancel(context.Background())
 	for _, tenant := range cfg.Tenants {
-		fileWatcher, err := watcher.NewFileWatcher(syncServices[tenant.Name], logger)
+		fileWatcher, err := watcher.NewFileWatcher(syncServices[tenant.Name], logger, func() {
+			healthChecker.ForceRefresh()
+		})
 		if err != nil {
 			cleanupCancel()
 			return nil, nil, fmt.Errorf("failed to create file watcher for tenant %s: %w", tenant.Name, err)
@@ -256,9 +261,6 @@ func initializeServices(configPath string) (*ServiceContainer, context.CancelFun
 
 		fileWatcher.Start(watcherCtx)
 	}
-
-	// Initialize health checker with 5-minute refresh interval
-	healthChecker := health.NewChecker(cfg, logger, 5*time.Minute)
 
 	return &ServiceContainer{
 		Logger:         logger,
@@ -283,20 +285,18 @@ func initializeServices(configPath string) (*ServiceContainer, context.CancelFun
 func setupSettingsRoutes(router *gin.Engine, authMiddleware, syncMiddleware, adminMiddleware gin.HandlerFunc,
 	credStores map[string]*store.CredentialStore, groupStore *store.GroupStore, userStore *store.UserStore,
 	roleStores map[string]*store.GroupStore, policyStores map[string]*store.PolicyStore, iamClients map[string]*s3client.IAMClient, adminClients map[string]backend.AdminClient,
-	groupManagers map[string]interface{}, syncServices map[string]*sync.SyncService, cfg *config.Config, logger *logrus.Logger, userManagers map[string]backend.UserManager, adminUsernames map[string]string) {
+	groupManagers map[string]interface{}, syncServices map[string]*sync.SyncService, cfg *config.Config, logger *logrus.Logger, userManagers map[string]backend.UserManager, adminUsernames map[string]string, tenantValidator middleware.TenantValidator) {
 
 	// Build tenant admins map for tenant admin middleware
 	tenantAdmins := make(map[string][]string)
-	var tenantNames []string
 	for _, tenant := range cfg.Tenants {
-		tenantNames = append(tenantNames, tenant.Name)
 		tenantAdmins[tenant.Name] = tenant.TenantAdmins
 	}
 
 	// Create tenant admin middleware
 	tenantAdminMiddleware := middleware.RequireTenantAdmin(tenantAdmins, logger)
 
-	tenantMiddleware := middleware.TenantAuth(tenantNames, logger)
+	tenantMiddleware := middleware.TenantAuth(tenantValidator, logger)
 
 	settingsRoutes := router.Group("/tenant/:tenant/settings")
 	settingsRoutes.Use(tenantMiddleware)
@@ -373,9 +373,6 @@ func setupSettingsRoutes(router *gin.Engine, authMiddleware, syncMiddleware, adm
 		settingsRoutes.GET("/roles/:name", tenantAdminMiddleware, func(c *gin.Context) {
 			groupHandler(c).GetGroup(c)
 		})
-		settingsRoutes.GET("/groups", tenantAdminMiddleware, func(c *gin.Context) {
-			groupHandler(c).ListGroups(c)
-		})
 		// TENANT ADMIN ONLY - Mutation operations - sync handled in handler (SyncAllSCIM calls)
 		settingsRoutes.POST("/roles", tenantAdminMiddleware, func(c *gin.Context) {
 			groupHandler(c).CreateGroup(c)
@@ -387,51 +384,102 @@ func setupSettingsRoutes(router *gin.Engine, authMiddleware, syncMiddleware, adm
 			groupHandler(c).DeleteGroup(c)
 		})
 
-		// GET /settings/sram-groups - Get SRAM groups for the tenant (for role creation)
+		// GET /settings/sram-groups - Get SCIM groups for the tenant (for role creation)
 		settingsRoutes.GET("/sram-groups", tenantAdminMiddleware, func(c *gin.Context) {
 			tenantName := c.GetString(middleware.TenantContextKey)
 
-			if !cfg.SRAM.Enabled {
-				c.JSON(http.StatusOK, gin.H{"Resources": []interface{}{}})
-				return
-			}
-
 			// Find tenant config
-			var tenantCfg *config.TenantConfig
+			var tenantConfig *config.TenantConfig
 			for i := range cfg.Tenants {
 				if cfg.Tenants[i].Name == tenantName {
-					tenantCfg = &cfg.Tenants[i]
+					tenantConfig = &cfg.Tenants[i]
 					break
 				}
 			}
-
-			if tenantCfg == nil || tenantCfg.SRAMCollaborationID == "" {
-				c.JSON(http.StatusOK, gin.H{"Resources": []interface{}{}})
+			if tenantConfig == nil {
+				logger.WithField("tenant", tenantName).Error("Tenant config not found")
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "Tenant configuration not found"})
 				return
 			}
 
-			// Get collaboration details from SRAM
-			sramClient := sram.NewClient(cfg.SRAM.APIURL, cfg.SRAM.APIKey)
-			collaboration, err := sramClient.GetCollaboration(tenantCfg.SRAMCollaborationID, cfg.OIDC.ClientID)
-			if err != nil {
-				logger.WithError(err).Error("Failed to get SRAM collaboration details")
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch SRAM groups"})
-				return
+			// Get the global URN from SRAM API
+			var collaborationShortName string
+			if cfg.SRAM.Enabled && tenantConfig.SRAMCollaborationID != "" {
+				sramClient := sram.NewClient(cfg.SRAM.APIURL, cfg.SRAM.APIKey)
+				globalURN, err := sramClient.GetCollaborationGlobalURN(tenantConfig.SRAMCollaborationID)
+				if err != nil {
+					logger.WithFields(logrus.Fields{
+						"tenant":           tenantName,
+						"collaboration_id": tenantConfig.SRAMCollaborationID,
+						"error":            err,
+					}).Warn("Failed to get global URN from SRAM, falling back to empty filter")
+					collaborationShortName = ""
+				} else {
+					collaborationShortName = globalURN
+				}
+			} else {
+				logger.WithField("tenant", tenantName).Warn("SRAM not enabled or no collaboration ID, showing all groups")
+				collaborationShortName = ""
 			}
 
-			// Service connection is now handled automatically in GetCollaboration
+			// Get all SCIM groups from the user store
+			var scimGroups []gin.H
 
-			// Convert SRAM groups to SCIM format for frontend compatibility
-			scimGroups := make([]gin.H, 0, len(collaboration.Groups))
-			for _, group := range collaboration.Groups {
+			// Get all groups - we'll filter them later if needed
+			// For tenant admin, show all groups they might be able to assign roles to
+			allGroups := userStore.GetAllGroups()
+
+			// Log what we found
+			logger.WithFields(logrus.Fields{
+				"tenant":                   tenantName,
+				"collaboration_short_name": collaborationShortName,
+				"total_groups_found":       len(allGroups),
+			}).Info("Fetching SCIM groups for role creation")
+
+			for _, group := range allGroups {
+				// Extract urn from extensions
+				urn := ""
+				if ext, ok := group.Extensions["urn:mace:surf.nl:sram:scim:extension:Group"]; ok {
+					if extMap, ok := ext.(map[string]interface{}); ok {
+						if urnVal, ok := extMap["urn"].(string); ok {
+							urn = urnVal
+						}
+					}
+				}
+
+				// Filter: only include groups that belong to this tenant's collaboration
+				if collaborationShortName != "" {
+					// Groups must have a urn that starts with the collaboration short_name
+					if urn == "" || !strings.HasPrefix(urn, collaborationShortName) {
+						logger.WithFields(logrus.Fields{
+							"group_id":     group.ID,
+							"display_name": group.DisplayName,
+							"urn":          urn,
+							"reason":       "urn does not match collaboration short_name",
+						}).Debug("Skipping SCIM group - not in tenant collaboration")
+						continue
+					}
+				}
+
+				logger.WithFields(logrus.Fields{
+					"group_id":     group.ID,
+					"display_name": group.DisplayName,
+					"urn":          urn,
+				}).Debug("Including SCIM group for tenant")
+
 				scimGroups = append(scimGroups, gin.H{
-					"id":          group.Identifier, // Use UUID identifier
-					"displayName": group.Name,
-					"shortName":   group.ShortName,
-					"description": group.Description,
-					"globalUrn":   group.GlobalURN,
+					"id":          group.ID,
+					"displayName": group.DisplayName,
+					"shortName":   urn, // Use urn as shortName for compatibility
+					"description": "",
+					"globalUrn":   urn,
 				})
 			}
+
+			logger.WithFields(logrus.Fields{
+				"tenant":          tenantName,
+				"groups_returned": len(scimGroups),
+			}).Info("Returning filtered SCIM groups for role creation")
 
 			c.JSON(http.StatusOK, gin.H{
 				"Resources":    scimGroups,
@@ -789,7 +837,7 @@ func main() {
 		}
 
 		// Create tenant directory structure
-		tenantDir := fmt.Sprintf("./data/tenants/%s", req.Name)
+		tenantDir := fmt.Sprintf("/app/data/tenants/%s", req.Name)
 		if err := os.MkdirAll(tenantDir, 0755); err != nil {
 			services.Logger.WithError(err).Error("Failed to create tenant directory")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create tenant directory"})
@@ -881,6 +929,109 @@ func main() {
 		// Add to in-memory config
 		services.Cfg.Tenants = append(services.Cfg.Tenants, *newTenantCfg)
 
+		// Initialize services for the new tenant
+		tenantName := newTenantCfg.Name
+
+		// Initialize role store for this tenant
+		services.Logger.WithField("roles_directory", newTenantCfg.Roles.Directory).Info("Initializing role store for new tenant")
+		roleStore, err := store.NewGroupStore(newTenantCfg.Roles.Directory, services.Logger)
+		if err != nil {
+			services.Logger.WithError(err).Error("Failed to initialize role store for new tenant")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Tenant created but failed to initialize services"})
+			return
+		}
+		services.RoleStores[tenantName] = roleStore
+
+		// Initialize policy store for this tenant
+		policyStore, err := store.NewPolicyStore(newTenantCfg.Policies.Directory, services.Logger)
+		if err != nil {
+			services.Logger.WithError(err).Error("Failed to initialize policy store for new tenant")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Tenant created but failed to initialize services"})
+			return
+		}
+		services.PolicyStores[tenantName] = policyStore
+
+		// Initialize policy engine for this tenant
+		policyEngine, err := policy.NewEngine(newTenantCfg.Policies, services.Logger)
+		if err != nil {
+			services.Logger.WithError(err).Error("Failed to initialize policy engine for new tenant")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Tenant created but failed to initialize services"})
+			return
+		}
+		services.PolicyEngines[tenantName] = policyEngine
+
+		// Initialize IAM client for this tenant (may have empty credentials initially)
+		iamClient, err := s3client.NewIAMClient(services.Cfg.S3, newTenantCfg.IAM, services.Logger)
+		if err != nil {
+			services.Logger.WithError(err).Error("Failed to initialize IAM client for new tenant")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Tenant created but failed to initialize services"})
+			return
+		}
+		services.IAMClients[tenantName] = iamClient
+
+		// Initialize AWS CLI client for this tenant
+		awsCliClient, err := awscli.NewClient(services.Cfg.S3.Endpoint, newTenantCfg.IAM.AccessKey, newTenantCfg.IAM.SecretKey, services.Cfg.S3.Region, tenantName, services.Logger)
+		if err != nil {
+			services.Logger.WithError(err).Error("Failed to initialize AWS CLI client for new tenant")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Tenant created but failed to initialize services"})
+			return
+		}
+
+		// Use the client as admin client
+		services.AdminClients[tenantName] = awsCliClient
+
+		// Initialize user manager for this tenant
+		services.UserManagers[tenantName] = awscli.NewUserManager(awsCliClient)
+
+		// Initialize group manager for this tenant
+		services.GroupManagers[tenantName] = awscli.NewGroupManager(awsCliClient)
+
+		// Initialize credential store for this tenant
+		credStore, err := store.NewCredentialStore(newTenantCfg.Credentials.File, services.Logger)
+		if err != nil {
+			services.Logger.WithError(err).Error("Failed to initialize credential store for new tenant")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Tenant created but failed to initialize services"})
+			return
+		}
+		services.CredStores[tenantName] = credStore
+
+		// Set admin username for this tenant
+		adminUsername := ""
+		if len(newTenantCfg.TenantAdmins) > 0 {
+			adminUsername = newTenantCfg.TenantAdmins[0] // Use first tenant admin as primary
+		}
+		services.AdminUsernames[tenantName] = adminUsername
+
+		// Initialize sync service for this tenant
+		syncService := sync.NewSyncService(iamClient, services.GroupStore, services.UserStore, credStore, newTenantCfg.Policies.Directory, adminUsername, services.Logger)
+		services.SyncServices[tenantName] = syncService
+
+		// Create file watcher for the new tenant
+		fileWatcher, err := watcher.NewFileWatcher(syncService, services.Logger, func() {
+			services.HealthChecker.ForceRefresh()
+		})
+		if err != nil {
+			services.Logger.WithError(err).WithField("tenant", tenantName).Error("Failed to create file watcher for new tenant")
+			// Continue anyway - tenant creation succeeded
+		} else {
+			// Add directories to watch
+			if err := fileWatcher.AddDirectory("./data/scim/Users"); err != nil {
+				services.Logger.WithError(err).WithField("tenant", tenantName).Error("Failed to watch users directory for new tenant")
+			}
+			if err := fileWatcher.AddDirectory("./data/scim/Groups"); err != nil {
+				services.Logger.WithError(err).WithField("tenant", tenantName).Error("Failed to watch groups directory for new tenant")
+			}
+			if err := fileWatcher.AddDirectory(newTenantCfg.Policies.Directory); err != nil {
+				services.Logger.WithError(err).WithField("tenant", tenantName).Error("Failed to watch policies directory for new tenant")
+			}
+
+			// Start the file watcher
+			fileWatcher.Start(context.Background()) // Use background context since this runs for the lifetime of the service
+			services.Logger.WithField("tenant", tenantName).Info("Started file watcher for new tenant")
+		}
+
+		services.Logger.WithField("tenant", tenantName).Info("Initialized services for new tenant")
+
 		response := gin.H{
 			"name":        req.Name,
 			"description": req.Description,
@@ -894,6 +1045,10 @@ func main() {
 		}
 
 		services.Logger.WithField("tenant", req.Name).Info("Tenant created successfully")
+
+		// Force refresh health status so the new tenant appears immediately in the dashboard
+		services.HealthChecker.ForceRefresh()
+
 		c.JSON(http.StatusCreated, response)
 	})
 
@@ -977,6 +1132,10 @@ func main() {
 		}
 
 		services.Logger.WithField("tenant", tenantName).Info("Tenant updated successfully")
+
+		// Force refresh health status so any config changes appear immediately in the dashboard
+		services.HealthChecker.ForceRefresh()
+
 		c.JSON(http.StatusOK, gin.H{
 			"name":        tenantName,
 			"description": req.Description,
@@ -1145,6 +1304,10 @@ func main() {
 		}
 
 		services.Logger.WithField("tenant", tenantName).Info("Tenant deletion completed successfully")
+
+		// Force refresh health status so tenant removal appears immediately in the dashboard
+		services.HealthChecker.ForceRefresh()
+
 		c.JSON(http.StatusOK, gin.H{
 			"message": "Tenant deleted successfully",
 		})
@@ -1333,12 +1496,16 @@ func main() {
 		})
 	})
 
-	// Build tenant names for tenant middleware
-	tenantNames := make([]string, 0, len(services.Cfg.Tenants))
-	for _, tenant := range services.Cfg.Tenants {
-		tenantNames = append(tenantNames, tenant.Name)
+	// Create tenant validator function that checks against current tenant list
+	tenantValidator := func(tenantName string) bool {
+		for _, tenant := range services.Cfg.Tenants {
+			if tenant.Name == tenantName {
+				return true
+			}
+		}
+		return false
 	}
-	tenantMiddleware := middleware.TenantAuth(tenantNames, services.Logger)
+	tenantMiddleware := middleware.TenantAuth(tenantValidator, services.Logger)
 
 	oidcConfigHandler := handler.NewOIDCConfigHandler(services.Cfg)
 
@@ -1346,8 +1513,12 @@ func main() {
 	router.GET("/oidc-config", func(c *gin.Context) {
 		oidcConfigHandler.GetOIDCConfig(c)
 	})
+	router.POST("/oidc/token", func(c *gin.Context) {
+		oidcConfigHandler.ExchangeToken(c)
+	})
 
 	router.GET("/tenant/:tenant/oidc-config", tenantMiddleware, oidcConfigHandler.GetOIDCConfig)
+	router.POST("/tenant/:tenant/oidc/token", tenantMiddleware, oidcConfigHandler.ExchangeToken)
 
 	// Metrics endpoint
 	if services.Cfg.Monitoring.MetricsEnabled {
@@ -1488,6 +1659,9 @@ func main() {
 			"total_admins":   len(tenant.TenantAdmins),
 			"accepted_users": acceptedEmails,
 		})
+
+		// Force refresh health status so admin acceptance appears immediately in the dashboard
+		services.HealthChecker.ForceRefresh()
 	})
 
 	// POST /tenants/:name/sram-refresh - Refresh SRAM collaboration status for a tenant (global admin only)
@@ -1548,12 +1722,24 @@ func main() {
 			"admin_accepted":   adminAccepted,
 			"refreshed_at":     time.Now().Format(time.RFC3339),
 		})
+
+		// Force refresh health status so updated status appears immediately in the dashboard
+		services.HealthChecker.ForceRefresh()
 	})
 
 	// Settings/Credentials management endpoints (authenticated)
+	// Create tenant validator function that checks against current tenant list
+	tenantValidator = func(tenantName string) bool {
+		for _, tenant := range services.Cfg.Tenants {
+			if tenant.Name == tenantName {
+				return true
+			}
+		}
+		return false
+	}
 	setupSettingsRoutes(router, authMiddleware, syncMiddleware, adminMiddleware,
 		services.CredStores, services.GroupStore, services.UserStore, services.RoleStores, services.PolicyStores, services.IAMClients, services.AdminClients, services.GroupManagers,
-		services.SyncServices, services.Cfg, services.Logger, services.UserManagers, services.AdminUsernames)
+		services.SyncServices, services.Cfg, services.Logger, services.UserManagers, services.AdminUsernames, tenantValidator)
 
 	// Also set up root-level settings routes for global admins (when tenant context is not available)
 	setupRootSettingsRoutes(router, authMiddleware, syncMiddleware, adminMiddleware,
@@ -1664,11 +1850,11 @@ func main() {
 		s3Handler.ProxyToS3(c, s3Client, bucket, key, userInfo)
 	}
 	// Serve index.html for OIDC callback (frontend handles the callback in JavaScript)
-	router.GET("/tenant/:tenant/callback", tenantMiddleware, func(c *gin.Context) {
+	router.GET("/tenant/:tenant/redirect_uri", tenantMiddleware, func(c *gin.Context) {
 		c.File("./frontend/index.html")
 	})
 	// Also serve callback from root path (for cases where tenant context is not set)
-	router.GET("/callback", func(c *gin.Context) {
+	router.GET("/redirect_uri", func(c *gin.Context) {
 		c.File("./frontend/index.html")
 	})
 	// Serve specific static files
