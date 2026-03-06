@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Path, HTTPException, Body
+from fastapi import APIRouter, Path, HTTPException, Body, Request, Depends
 from pydantic import BaseModel
 from typing import List, Optional, Any
 from pathlib import Path
@@ -200,7 +200,33 @@ def validate_policy_json(policy: Any) -> Optional[str]:
     return None
 
 
-@router.post("/policies/validate")
+def require_tenant_admin(request: Request, tenant: str = Path(...)) -> dict:
+    ui = getattr(request.state, "userinfo", None)
+    if not ui:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # Check per-tenant admin list
+    tenant_cfg = load_tenant_config(tenant)
+    tenant_admins = tenant_cfg.get("tenant_admins") or tenant_cfg.get("tenantAdmins") or []
+    email = ui.get("email") if isinstance(ui, dict) else None
+    if email and email in tenant_admins:
+        return ui
+
+    # Allow global admins
+    global_cfg = load_config("config.yaml")
+    global_admins = global_cfg.get("global_admins") or global_cfg.get("globalAdmins") or []
+    if email and email in global_admins:
+        return ui
+
+    # Check roles/groups claim
+    groups = ui.get("groups") or ui.get("roles") or []
+    if isinstance(groups, list) and "admin" in groups:
+        return ui
+
+    raise HTTPException(status_code=403, detail="Tenant admin access required")
+
+
+@router.post("/policies/validate", dependencies=[Depends(require_tenant_admin)])
 def validate_policy(body: dict = Body(...), tenant: str = Path(...)):
     err = validate_policy_json(body)
     if err:
@@ -208,7 +234,7 @@ def validate_policy(body: dict = Body(...), tenant: str = Path(...)):
     return {"valid": True}
 
 
-@router.post("/policies")
+@router.post("/policies", dependencies=[Depends(require_tenant_admin)])
 def create_policy(req: PolicyReq, tenant: str = Path(...)):
     d = policies_dir_for_tenant(tenant)
     d.mkdir(parents=True, exist_ok=True)
@@ -223,7 +249,7 @@ def create_policy(req: PolicyReq, tenant: str = Path(...)):
     return {"created": True, "name": name}
 
 
-@router.put("/policies/{name}")
+@router.put("/policies/{name}", dependencies=[Depends(require_tenant_admin)])
 def update_policy(name: str, body: dict = Body(...), tenant: str = Path(...)):
     d = policies_dir_for_tenant(tenant)
     p = d / f"{name}.json"
@@ -236,7 +262,7 @@ def update_policy(name: str, body: dict = Body(...), tenant: str = Path(...)):
     return {"updated": True, "name": name}
 
 
-@router.delete("/policies/{name}")
+@router.delete("/policies/{name}", dependencies=[Depends(require_tenant_admin)])
 def delete_policy(name: str, tenant: str = Path(...)):
     d = policies_dir_for_tenant(tenant)
     p = d / f"{name}.json"
@@ -261,7 +287,7 @@ def list_roles(tenant: str = Path(...)):
     return {"tenant": tenant, "roles": roles}
 
 
-@router.get("/roles/{name}")
+@router.get("/roles/{name}", dependencies=[Depends(require_tenant_admin)])
 def get_role(name: str, tenant: str = Path(...)):
     d = roles_dir_for_tenant(tenant)
     p = d / f"{name}.json"
@@ -279,7 +305,7 @@ class RoleReq(BaseModel):
     policies: List[str] = []
 
 
-@router.post("/roles")
+@router.post("/roles", dependencies=[Depends(require_tenant_admin)])
 def create_role(req: RoleReq, tenant: str = Path(...)):
     d = roles_dir_for_tenant(tenant)
     d.mkdir(parents=True, exist_ok=True)
@@ -289,7 +315,7 @@ def create_role(req: RoleReq, tenant: str = Path(...)):
     return {"created": True}
 
 
-@router.put("/roles/{name}")
+@router.put("/roles/{name}", dependencies=[Depends(require_tenant_admin)])
 def update_role(name: str, req: RoleReq, tenant: str = Path(...)):
     d = roles_dir_for_tenant(tenant)
     p = d / f"{name}.json"
@@ -300,7 +326,7 @@ def update_role(name: str, req: RoleReq, tenant: str = Path(...)):
     return {"updated": True}
 
 
-@router.delete("/roles/{name}")
+@router.delete("/roles/{name}", dependencies=[Depends(require_tenant_admin)])
 def delete_role(name: str, tenant: str = Path(...)):
     d = roles_dir_for_tenant(tenant)
     p = d / f"{name}.json"
@@ -310,7 +336,7 @@ def delete_role(name: str, tenant: str = Path(...)):
     return {"deleted": True}
 
 
-@router.get("/sram-groups")
+@router.get("/sram-groups", dependencies=[Depends(require_tenant_admin)])
 def get_sram_groups(tenant: str = Path(...)):
     cfg = load_tenant_config(tenant)
     collab = cfg.get("sram_collaboration_id", "")
