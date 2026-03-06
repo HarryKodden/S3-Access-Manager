@@ -361,3 +361,54 @@ def get_sram_groups(tenant: str = Path(...)):
             except Exception:
                 continue
     return {"Resources": groups, "totalResults": len(groups)}
+
+
+# User management endpoints (tenant-scoped) - tenant admin only
+@router.get("/users", dependencies=[Depends(require_tenant_admin)])
+def list_users(tenant: str = Path(...)):
+    users_dir = Path("./data/scim/Users")
+    users = []
+    if users_dir.exists():
+        for p in users_dir.glob("*.json"):
+            try:
+                u = json.loads(p.read_text())
+                users.append({
+                    "id": u.get("id"),
+                    "userName": u.get("userName"),
+                    "displayName": u.get("displayName"),
+                    "emails": u.get("emails", []),
+                })
+            except Exception:
+                continue
+    return {"tenant": tenant, "users": users}
+
+
+@router.get("/users/{username}/details", dependencies=[Depends(require_tenant_admin)])
+def get_user_details(username: str, tenant: str = Path(...)):
+    users_dir = Path("./data/scim/Users")
+    if not users_dir.exists():
+        raise HTTPException(status_code=404, detail="user not found")
+    for p in users_dir.glob("*.json"):
+        try:
+            u = json.loads(p.read_text())
+            if u.get("userName") == username or u.get("id") == username:
+                return u
+        except Exception:
+            continue
+    raise HTTPException(status_code=404, detail="user not found")
+
+
+@router.delete("/users/{username}", dependencies=[Depends(require_tenant_admin)])
+def delete_user(username: str, tenant: str = Path(...)):
+    users_dir = Path("./data/scim/Users")
+    if not users_dir.exists():
+        raise HTTPException(status_code=404, detail="user not found")
+    for p in users_dir.glob("*.json"):
+        try:
+            u = json.loads(p.read_text())
+            if u.get("userName") == username or u.get("id") == username:
+                p.unlink()
+                return {"deleted": True}
+        except Exception:
+            continue
+    raise HTTPException(status_code=404, detail="user not found")
