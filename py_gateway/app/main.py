@@ -1,8 +1,9 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from app.config import load_config
 from app.routers import tenants, settings
+from app.auth import OIDCMiddleware, require_auth
 
 app = FastAPI(title="S3 Access Manager (Python)")
 
@@ -18,6 +19,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Attach lightweight OIDC middleware (calls /userinfo when bearer token present)
+app.add_middleware(OIDCMiddleware)
 
 
 @app.get("/health")
@@ -37,8 +41,8 @@ def styles():
     return FileResponse("./frontend/styles.css")
 
 
-app.include_router(tenants.router)
-app.include_router(settings.router)
+app.include_router(tenants.router, dependencies=[Depends(require_auth)])
+app.include_router(settings.router, dependencies=[Depends(require_auth)])
 
 
 if __name__ == "__main__":
