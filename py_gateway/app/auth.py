@@ -3,6 +3,7 @@ from typing import Optional
 import httpx
 from fastapi import Request, HTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
+from app.config import load_config
 
 
 OIDC_ISSUER = os.getenv("OIDC_ISSUER", "http://localhost:8888")
@@ -43,3 +44,36 @@ def require_auth(request: Request) -> dict:
     if not ui:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return ui
+
+
+def require_admin(request: Request) -> dict:
+    """Dependency to require global admin access.
+
+    Checks, in order:
+    - `request.state.userinfo` exists
+    - If `is_admin` claim present and truthy -> allow
+    - If user's email is listed in `global_admins` in config -> allow
+    - If roles/groups claim contains 'admin' -> allow
+    Otherwise raise 403
+    """
+    ui = getattr(request.state, "userinfo", None)
+    if not ui:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # 1) explicit is_admin flag
+    if isinstance(ui, dict) and ui.get("is_admin"):
+        return ui
+
+    # 2) check global_admins in config
+    cfg = load_config("config.yaml")
+    global_admins = cfg.get("global_admins") or cfg.get("globalAdmins") or []
+    email = ui.get("email") if isinstance(ui, dict) else None
+    if email and email in global_admins:
+        return ui
+
+    # 3) check roles/groups claim (common claim names: groups)
+    groups = ui.get("groups") or ui.get("roles") or []
+    if isinstance(groups, list) and "admin" in groups:
+        return ui
+
+    raise HTTPException(status_code=403, detail="Admin access required")
