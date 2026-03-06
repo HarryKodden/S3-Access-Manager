@@ -41,6 +41,23 @@ def styles():
     return FileResponse("./frontend/styles.css")
 
 
+# Serve index and SPA fallback
+@app.get("/")
+def index():
+    return FileResponse("./frontend/index.html")
+
+
+@app.get("/{full_path:path}")
+def spa_fallback(full_path: str):
+    # If requested file exists under frontend, serve it; otherwise return index.html
+    from pathlib import Path
+
+    fp = Path("./frontend") / full_path
+    if fp.exists() and fp.is_file():
+        return FileResponse(str(fp))
+    return FileResponse("./frontend/index.html")
+
+
 app.include_router(tenants.router, dependencies=[Depends(require_auth)])
 app.include_router(settings.router, dependencies=[Depends(require_auth)])
 
