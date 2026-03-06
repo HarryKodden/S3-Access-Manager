@@ -5,7 +5,6 @@ services:
     expose:
       - "8888"
     # Use bridge networking so services can reach each other by service name.
-    # network_mode: host  # removed for cross-platform compatibility (Docker Desktop)
     ports:
       - "8888:8888"
     environment:
@@ -51,8 +50,9 @@ services:
     build: ./py_gateway
     expose:
       - "9000"
-    ports:
-      - "9000:9000"
+    network_mode: host  # Use host networking for direct access to services by localhost
+    # ports:
+    #   - "9000:9000"
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./frontend:/app/frontend:ro
@@ -64,6 +64,10 @@ services:
       - .env
     environment:
       - TZ=UTC
+      - OIDC_ISSUER=http://oidc:8888
+      - OIDC_BYPASS=true
+      - BYPASS_EMAIL=harry@kodden.nl
+      - BYPASS_GROUPS=test-group
     restart: unless-stopped
     depends_on:
       oidc:

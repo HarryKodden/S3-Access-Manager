@@ -3,11 +3,14 @@ from pydantic import BaseModel
 from typing import List, Optional, Any
 from pathlib import Path as FSPath
 import json
+import logging
 import os
 import secrets
 import yaml
 from ..backend import AWSAdmin
 from ..config import load_config
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/tenant/{tenant}/settings")
 
@@ -456,26 +459,52 @@ def delete_role(name: str, tenant: str = Path(...)):
 
 @router.get("/sram-groups", dependencies=[Depends(require_tenant_admin)])
 def get_sram_groups(tenant: str = Path(...)):
-    cfg = load_tenant_config(tenant)
-    collab = cfg.get("sram_collaboration_id", "")
-    # Read global SCIM groups and filter by URN if collaboration is configured
+    tenant_cfg = load_tenant_config(tenant)
+    collab_id = tenant_cfg.get("sram_collaboration_id", "")
+
+    # Attempt to resolve collaboration global_urn from SRAM API.
+    # Falls back gracefully (shows all groups) when SRAM is not configured
+    # or the API call fails (e.g. in dev/test environments).
+    collab_urn = ""
+    if collab_id:
+        global_cfg = load_config("config.yaml")
+        sram_cfg = global_cfg.get("sram") or {}
+        if sram_cfg.get("enabled") and sram_cfg.get("api_url") and sram_cfg.get("api_key"):
+            try:
+                from ..sram import SRAMClient
+                sram_client = SRAMClient(sram_cfg["api_url"], sram_cfg["api_key"])
+                collab_urn = sram_client.get_collaboration_global_urn(collab_id)
+                sram_client.close()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to get SRAM global URN for tenant %s (collab %s): %s",
+                    tenant, collab_id, exc,
+                )
+
+    # Read global SCIM groups and filter by URN prefix when available.
+    # SCIM group JSON files have extension attributes as top-level keys
+    # prefixed with "urn:" (e.g. "urn:mace:surf.nl:sram:scim:extension:Group").
     scim_dir = FSPath("./data/scim/Groups")
     groups = []
     if scim_dir.exists():
         for p in scim_dir.glob("*.json"):
             try:
-                g = json.loads(p.read_text())
+                raw = json.loads(p.read_text())
+                # Extract URN from the first top-level extension key starting with "urn:".
                 urn = ""
-                ext = g.get("Extensions") or g.get("extensions") or {}
-                # Best-effort extraction
-                if isinstance(ext, dict):
-                    for k, v in ext.items():
-                        if isinstance(v, dict) and "urn" in v:
-                            urn = v.get("urn")
-                            break
-                if collab and urn and not urn.startswith(collab):
+                for key, val in raw.items():
+                    if key.startswith("urn:") and isinstance(val, dict):
+                        urn = val.get("urn", "")
+                        break
+                # Filter: skip groups whose URN doesn't match the collaboration.
+                if collab_urn and (not urn or not urn.startswith(collab_urn)):
                     continue
-                groups.append({"id": g.get("id"), "displayName": g.get("displayName"), "shortName": urn})
+                groups.append({
+                    "id": raw.get("id"),
+                    "displayName": raw.get("displayName"),
+                    "shortName": urn,
+                    "globalUrn": urn,
+                })
             except Exception:
                 continue
     return {"Resources": groups, "totalResults": len(groups)}
@@ -501,7 +530,7 @@ def list_users(tenant: str = Path(...)):
     return {"tenant": tenant, "users": users}
 
 
-@router.get("/users/{username}/details", dependencies=[Depends(require_tenant_admin)])
+@router.get("/users/{username}", dependencies=[Depends(require_tenant_admin)])
 def get_user_details(username: str, tenant: str = Path(...)):
     users_dir = FSPath("./data/scim/Users")
     if not users_dir.exists():
@@ -518,7 +547,7 @@ def get_user_details(username: str, tenant: str = Path(...)):
 
 @router.delete("/users/{username}", dependencies=[Depends(require_tenant_admin)])
 def delete_user(username: str, tenant: str = Path(...)):
-    users_dir = Path("./data/scim/Users")
+    users_dir = FSPath("./data/scim/Users")
     if not users_dir.exists():
         raise HTTPException(status_code=404, detail="user not found")
     for p in users_dir.glob("*.json"):

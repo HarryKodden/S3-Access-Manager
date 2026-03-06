@@ -7,6 +7,10 @@ from app.config import load_config
 
 
 OIDC_ISSUER = os.getenv("OIDC_ISSUER", "http://localhost:8888")
+OIDC_BYPASS = os.getenv("OIDC_BYPASS", "false").lower() in ("1", "true", "yes")
+# Bypass identity defaults (can be overridden by env)
+BYPASS_EMAIL = os.getenv("BYPASS_EMAIL", "harry@kodden.nl")
+BYPASS_GROUPS = os.getenv("BYPASS_GROUPS", "test-group")
 
 
 async def fetch_userinfo(token: str) -> Optional[dict]:
@@ -29,6 +33,16 @@ async def fetch_userinfo(token: str) -> Optional[dict]:
 
 class OIDCMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        # If bypass mode enabled, inject a constant identity for all requests
+        if OIDC_BYPASS:
+            groups = [g.strip() for g in BYPASS_GROUPS.split(',') if g.strip()]
+            request.state.userinfo = {
+                "email": BYPASS_EMAIL,
+                "groups": groups,
+                "sub": BYPASS_EMAIL,
+            }
+            return await call_next(request)
+
         auth = request.headers.get("authorization") or request.headers.get("Authorization")
         if auth and auth.lower().startswith("bearer "):
             token = auth.split(None, 1)[1]
